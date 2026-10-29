@@ -1,0 +1,36 @@
+[package]
+name = "neewertv"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Bridge a NEEWER NS03-series TV backlight onto MQTT"
+repository = "https://github.com/Hyper-Dragon/NeewerTV"
+readme = "README.md"
+keywords = ["bluetooth", "ble", "mqtt", "home-assistant", "backlight"]
+categories = ["hardware-support", "api-bindings"]
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+btleplug = "0.11"
+futures = "0.3"
+rumqttc = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = "1"
+
+[profile.release]
+# Size over raw speed: this is an I/O-bound bridge, and a smaller image is worth
+# more to the people running it on a Pi than the last few percent of a memcpy.
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
