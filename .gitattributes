@@ -1,0 +1,26 @@
+# Normalise line endings on commit; the container builds on Linux and a stray CRLF
+# in a shell script or Dockerfile produces a failure that looks like anything but CRLF.
+* text=auto eol=lf
+
+*.rs    text
+*.toml  text
+*.md    text
+*.yml   text
+*.yaml  text
+*.json  text
+*.sh    text eol=lf
+Dockerfile text eol=lf
+
+# Windows-only tooling in the repo should keep whatever it needs.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.psd   binary
+*.zip   binary
+
+# Keep the generated lockfile out of diffs and merge conflicts.
+Cargo.lock merge=binary linguist-generated=false

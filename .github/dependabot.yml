@@ -1,0 +1,47 @@
+# Keep the toolchain and the actions current without a manual sweep.
+#
+# Cargo updates are grouped by kind so a week's worth of patch bumps arrives as
+# one PR to review rather than nine to merge.
+#
+# Note that history here is rewritten (the project keeps a single commit), and a
+# force-push closes an open pull request. Dependabot PRs therefore tend to
+# disappear rather than get merged — check the dependency versions in
+# `Cargo.toml` rather than trusting the absence of a PR to mean all is well.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      patch-and-minor:
+        applies-to: version-updates
+        update-types:
+          - patch
+          - minor
+    ignore:
+      # The two load-bearing dependencies, both pre-1.0 — where bumping the
+      # middle number is a breaking change by definition.
+      #
+      # btleplug 0.13 rewires the BLE layer, and the BLE layer is the one part of
+      # this daemon that cannot be tested in CI or on a machine without the strip
+      # in range. rumqttc 0.25 drags rustls and rustls-webpki forward with it.
+      # Both are wanted; neither is a Dependabot PR — they are a branch, a session
+      # with the real hardware, and a decision.
+      - dependency-name: btleplug
+        update-types: ["version-update:semver-major"]
+      - dependency-name: rumqttc
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3

@@ -1,0 +1,101 @@
+name: release
+
+on:
+  # Every push to main publishes an image, so there is always something current to
+  # pull onto a box and try. A tag publishes a stable version on top of that.
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # Lowercase on purpose: a container image path may not contain capitals, and
+  # the repository is called NeewerTV.
+  IMAGE_NAME: hyper-dragon/neewertv
+
+jobs:
+  publish:
+    name: publish image
+    runs-on: ubuntu-latest
+    permissions:
+      # Write, because a tag also publishes a release page with the changelog
+      # section for that version.
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          # ── platforms ──────────────────────────────────────────────────────
+          # amd64 only for now. The repository is private, and GitHub's arm64
+          # hosted runners are free only for public repositories — on a private
+          # one they bill minutes like any other runner.
+          #
+          # When this repository goes public, change this line to:
+          #     platforms: linux/amd64,linux/arm64
+          # and nothing else. Do NOT reach for QEMU to get there sooner: an
+          # emulated arm64 Rust build is slow, and produces a binary that never
+          # executes on the machine it was measured on.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Stamped into the binary so the status page and the startup log name
+          # the build, not just the version.
+          build-args: |
+            NEEWERTV_BUILD=${{ github.sha }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A tag publishes a page as well as an image. The notes come from the
+      # changelog section for that version, because that is where the writing
+      # already is — and a release page with GitHub's generated list of commit
+      # subjects on a squashed history says nothing at all.
+      - name: Publish release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          notes="$(awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found { print }
+          ' CHANGELOG.md)"
+
+          if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
+            echo "no changelog section for $version; falling back to generated notes"
+            gh release create "$tag" --title "NeewerTV $version" --generate-notes
+          else
+            printf 'What changed in %s.\n\n%s\n\nThe image is `%s:%s`.\n' \
+              "$version" "$notes" "$REGISTRY/$IMAGE_NAME" "$version" > /tmp/notes.md
+            gh release create "$tag" --title "NeewerTV $version" --notes-file /tmp/notes.md
+          fi

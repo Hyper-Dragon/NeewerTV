@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <defs>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#22c55e"/>
+      <stop offset="35%" stop-color="#06b6d4"/>
+      <stop offset="70%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#ef4444"/>
+    </linearGradient>
+    <radialGradient id="bloom" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.07"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1280" height="640" fill="#101215"/>
+  <ellipse cx="640" cy="461" rx="620" ry="150" fill="url(#bloom)"/>
+
+  <rect x="80" y="104" width="220" height="8" rx="4" fill="url(#accent)"/>
+
+  <text x="80" y="248" font-family="DejaVu Sans" font-size="92" font-weight="bold" fill="#f3f4f6">NeewerTV</text>
+  <text x="80" y="300" font-family="DejaVu Sans" font-size="30" fill="#8b93a1">for Home Assistant</text>
+
+  <text x="80" y="382" font-family="DejaVu Sans" font-size="38" fill="#e5e7eb">Your TV backlight, on MQTT.</text>
+
+    <rect x="86" y="452" width="44" height="18" rx="9" fill="#e23636"/>
+  <rect x="142" y="452" width="44" height="18" rx="9" fill="#e26936"/>
+  <rect x="198" y="452" width="44" height="18" rx="9" fill="#e29d36"/>
+  <rect x="254" y="452" width="44" height="18" rx="9" fill="#e2d136"/>
+  <rect x="310" y="452" width="44" height="18" rx="9" fill="#bfe236"/>
+  <rect x="366" y="452" width="44" height="18" rx="9" fill="#8ce236"/>
+  <rect x="422" y="452" width="44" height="18" rx="9" fill="#58e236"/>
+  <rect x="478" y="452" width="44" height="18" rx="9" fill="#36e247"/>
+  <rect x="534" y="452" width="44" height="18" rx="9" fill="#36e27b"/>
+  <rect x="590" y="452" width="44" height="18" rx="9" fill="#36e2ae"/>
+  <rect x="646" y="452" width="44" height="18" rx="9" fill="#36e2e2"/>
+  <rect x="702" y="452" width="44" height="18" rx="9" fill="#36aee2"/>
+  <rect x="758" y="452" width="44" height="18" rx="9" fill="#367be2"/>
+  <rect x="814" y="452" width="44" height="18" rx="9" fill="#3647e2"/>
+  <rect x="870" y="452" width="44" height="18" rx="9" fill="#5836e2"/>
+  <rect x="926" y="452" width="44" height="18" rx="9" fill="#8c36e2"/>
+  <rect x="982" y="452" width="44" height="18" rx="9" fill="#bf36e2"/>
+  <rect x="1038" y="452" width="44" height="18" rx="9" fill="#e236d1"/>
+  <rect x="1094" y="452" width="44" height="18" rx="9" fill="#e2369d"/>
+  <rect x="1150" y="452" width="44" height="18" rx="9" fill="#e23669"/>
+
+  <text x="80" y="566" font-family="DejaVu Sans" font-size="24" fill="#5b6472">NEEWER NS03 · Bluetooth · no vendor app, no cloud</text>
+  <text x="1200" y="566" font-family="DejaVu Sans" font-size="24" fill="#5b6472" text-anchor="end">ghcr.io/hyper-dragon/neewertv</text>
+</svg>
