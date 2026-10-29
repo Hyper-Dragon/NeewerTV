@@ -1,0 +1,16 @@
+# Build context pruning. The Docker build needs src/, Cargo.toml and Cargo.lock;
+# everything else is either regenerated or belongs only to the host.
+
+target/
+.git/
+.github/
+.vscode/
+docs/
+*.md
+!README.md
+
+**/*.rs.bk
+*.pdb
+.scratch/
+.env
+.env.*

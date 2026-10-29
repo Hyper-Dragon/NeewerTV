@@ -1,0 +1,101 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning in someone else's crate is not ours to fix, but a warning in ours
+  # fails the build — see the clippy step.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # btleplug reaches D-Bus through libdbus-sys, whose build script fails
+      # outright without dbus-1.pc. The container image installs these; a bare
+      # cargo job on a fresh runner has neither, and the failure arrives as a
+      # build-script panic rather than anything that mentions Bluetooth.
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+      - name: Test
+        run: cargo test --all-targets
+
+  container:
+    name: build and probe image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: neewertv:ci
+          # Same stamp as the release build, so a failure here is a failure of
+          # the thing that actually ships.
+          build-args: |
+            NEEWERTV_BUILD=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Build success is not the same as "the thing runs". Boot it, wait for the
+      # health endpoint, and only then call it good.
+      #
+      # MQTT_HOST is required by the config, so it has to be supplied even here;
+      # nothing is listening on 127.0.0.1, which is fine. The daemon retries the
+      # broker forever instead of exiting, and the web interface serves regardless
+      # -- which is exactly the behaviour being tested.
+      - name: Start and probe
+        run: |
+          set -euo pipefail
+          docker run -d --name neewertv-ci -p 8080:8080 \
+            -e MQTT_HOST=127.0.0.1 \
+            -e WEB_INTERFACE=observe \
+            neewertv:ci
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/healthz; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "health endpoint never answered" >&2
+              docker logs neewertv-ci >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          curl -fsS http://localhost:8080/healthz | grep -q '"status":"ok"'
+          docker exec neewertv-ci neewertv --healthcheck
+          docker logs neewertv-ci
+          docker rm -f neewertv-ci
+
+  # The Bluetooth path cannot be exercised on a hosted runner: there is no
+  # adapter, and QEMU-emulating one would prove nothing. Anything that needs the
+  # real strip stays on the README's manual checklist.

@@ -1,0 +1,120 @@
+# Example deployment: NeewerTV on its own, talking to a broker elsewhere.
+#
+#   cp .env.example .env      # then set MQTT_HOST (and credentials, if any)
+#   docker compose -f docker-compose.example.yml up -d
+#   docker logs -f neewertv
+#
+# Two lines below are load-bearing and explained where they appear:
+#   user: "0"                    — BlueZ's D-Bus policy on the host
+#   /run/dbus/system_bus_socket  — how the container reaches the radio
+#
+# If you would rather not run the container as root, see the note in the
+# Dockerfile: add a <policy user="…"> block to the host's bluetooth.conf and
+# change `user:` here to match. That is the only alternative; there is no third.
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  neewertv:
+    image: ghcr.io/hyper-dragon/neewertv:latest
+    container_name: neewertv
+    restart: unless-stopped
+    # Longer than Docker's default 10 s on purpose. Shutdown asks the worker to
+    # release the strip and waits up to 10 s for it, then the broker gets 5 s more
+    # to publish `offline`. A SIGKILL at 10 s would leave the strip believing it is
+    # still held, which is exactly what the next start has to work around.
+    stop_grace_period: 30s
+    logging:
+      <<: *default-logging
+
+    # The container's uid is the host's uid. BlueZ's default D-Bus policy grants
+    # org.bluez to root (and the bluetooth group), so an unprivileged uid is
+    # denied at the bus and the failure looks like "no adapter found".
+    user: "0"
+
+    environment:
+      TZ: ${TZ:-UTC}
+      # Point libdbus at the one socket we mount, rather than the whole /run/dbus
+      # tree. Same result, far less surface.
+      DBUS_SYSTEM_BUS_ADDRESS: unix:path=/run/dbus/system_bus_socket
+
+      # Advertised-name PATTERN, not an exact model string. The 5 m model is
+      # NH-PD20250145 and the 3 m is NH-PD20250103, so matching one exact string
+      # would silently fail for half the people running this.
+      BLE_NAME_MATCH: ${BLE_NAME_MATCH:-NH-PD*}
+
+      # Optional. Only needed when more than one strip is in radio range: the
+      # daemon refuses to pick for you rather than binding to whichever the scan
+      # happened to return first. Run with LOG_LEVEL=debug once to see addresses.
+      # BLE_DEVICE_ADDRESS: "AA:BB:CC:DD:EE:FF"
+
+      # How long to scan before concluding the strip is not there.
+      BLE_SCAN_SECONDS: ${BLE_SCAN_SECONDS:-12}
+
+      # Every 45 s by default: these controllers close a connection they have
+      # heard nothing on, which shows up as the backlight blinking and the log
+      # alternating `link lost` / `link up`. 0 sends nothing at all.
+      BLE_KEEPALIVE_SECONDS: ${BLE_KEEPALIVE_SECONDS:-45}
+
+      MQTT_HOST: ${MQTT_HOST:?set MQTT_HOST to your broker's address}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      MQTT_BASE: ${MQTT_BASE:-neewertv}
+      DISC_PREFIX: ${DISC_PREFIX:-homeassistant}
+
+      # Identity in Home Assistant. A second container MUST change both of these,
+      # or the two strips collide: one on the retained state topic, the other on
+      # the discovery unique_id, and Home Assistant renders either as a single
+      # light flickering between two devices.
+      DEVICE_ID: ${DEVICE_ID:-neewer_ns03}
+      DEVICE_NAME: ${DEVICE_NAME:-TV Backlight}
+
+      # One button per colour on the Home Assistant device page, so a colour
+      # alert needs no automation at all. Any of: red, orange, yellow, lime,
+      # green, cyan, blue, purple, pink, white -- or "none".
+      ALERT_BUTTONS: ${ALERT_BUTTONS:-red,blue,green}
+      ALERT_BUTTON_LENGTH: ${ALERT_BUTTON_LENGTH:-10}
+
+      # off | observe. `observe` serves the status page and the log tail and
+      # mounts nothing that can change the strip -- a route that does not exist
+      # cannot be reached by a mistake in an authorisation check.
+      WEB_INTERFACE: ${WEB_INTERFACE:-observe}
+      # Where the page listens inside the container. Leave it alone unless the
+      # default clashes with something else in the container; to move it on the
+      # host, change WEB_PORT below instead.
+      WEB_BIND: ${WEB_BIND:-0.0.0.0:8080}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+
+    volumes:
+      # A single socket, not /run/dbus. Mounting the directory hands the
+      # container every bus on the host.
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+
+    # Bluetooth is a radio in the host, not a device node, so there is nothing
+    # else to pass through — no /dev entry, no --privileged, no host network.
+    networks:
+      - neewertv
+
+networks:
+  neewertv:
+    driver: bridge
+
+# To pin a predictable address on an existing network, replace the block above:
+#
+#   networks:
+#     neewertv:
+#       ipv4_address: 10.250.0.42
+#
+#   networks:
+#     neewertv:
+#       external: true
+#       name: your-existing-network

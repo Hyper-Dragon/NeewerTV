@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or setup help
+    url: https://github.com/Hyper-Dragon/NeewerTV/discussions
+    about: For "how do I...", hardware-compatibility questions and general chat, please use Discussions rather than an issue.
+  - name: Security problem
+    url: https://github.com/Hyper-Dragon/NeewerTV/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue. See SECURITY.md.
