@@ -91,6 +91,27 @@ Bluetooth" — it's "a scan from this machine finds the strip". That's the test 
 step 1, and if it comes back empty, a different machine (or a USB dongle on a short
 extension) is the answer. No amount of software fixes a radio that can't hear it.
 
+## Quick start
+
+Requires a Linux host with Bluetooth/BlueZ and an existing MQTT broker.
+
+```bash
+docker run -d \
+  --name neewertv \
+  --restart unless-stopped \
+  --stop-timeout 30 \
+  --user 0 \
+  --mount type=bind,src=/run/dbus/system_bus_socket,dst=/run/dbus/system_bus_socket \
+  -e DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket \
+  -e MQTT_HOST=192.168.1.X \
+  -e MQTT_USERNAME=your-mqtt-username \
+  -e MQTT_PASSWORD=your-mqtt-password \
+  -p 127.0.0.1:8080:8080 \
+  ghcr.io/hyper-dragon/neewertv:latest
+```
+
+Replace the MQTT host, username and password with your broker details. Home Assistant discovers the light automatically via MQTT.
+
 ## Prerequisites
 
 ### Minimum
