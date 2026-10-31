@@ -15,16 +15,34 @@ env:
   IMAGE_NAME: hyper-dragon/neewertv
 
 jobs:
-  publish:
-    name: publish image
-    runs-on: ubuntu-latest
+  # ── build ──────────────────────────────────────────────────────────────────
+  # One job per architecture, each on a runner of that architecture, each
+  # pushing a single-arch image *by digest*. Nothing is tagged here — see the
+  # merge job below for why.
+  #
+  # Why a matrix rather than one build with `platforms: linux/amd64,linux/arm64`:
+  # the second platform would be emulated under QEMU, and a cross-built Rust
+  # binary is both slow to produce and never executed on the machine that
+  # compiled it. GitHub's arm64 hosted runners are free for public repositories,
+  # so both halves of this image are built on native hardware.
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
     permissions:
-      # Write, because a tag also publishes a release page with the changelog
-      # section for that version.
-      contents: write
+      contents: read
       packages: write
       id-token: write
       attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
     steps:
       - uses: actions/checkout@v7
 
@@ -35,6 +53,79 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Labels only: the tags this would produce are deliberately unused, since
+      # a tag on a one-architecture image is a lie the merge job later fixes.
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Stamped into the binary so the status page and the startup log name
+          # the build, not just the version.
+          build-args: |
+            NEEWERTV_BUILD=${{ github.sha }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          provenance: true
+          sbom: true
+          # A cache scope per architecture. One shared scope would have the two
+          # jobs evicting each other's layers on every run.
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      # Hand the digest to the merge job as an artefact. The file name is the
+      # digest itself, which is how the merge step rebuilds the reference.
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── merge ──────────────────────────────────────────────────────────────────
+  # Puts the two digests behind one manifest list and labels it. This is the
+  # only job that knows what the tags are, so `docker pull` gets an image that
+  # really is both architectures rather than whichever built last.
+  merge:
+    name: publish multi-arch image
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      # Write, because a tag also publishes a release page with the changelog
+      # section for that version.
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
 
       - uses: docker/metadata-action@v6
         id: meta
@@ -48,31 +139,15 @@ jobs:
             type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,format=short
 
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          # ── platforms ──────────────────────────────────────────────────────
-          # amd64 only for now. The repository is private, and GitHub's arm64
-          # hosted runners are free only for public repositories — on a private
-          # one they bill minutes like any other runner.
-          #
-          # When this repository goes public, change this line to:
-          #     platforms: linux/amd64,linux/arm64
-          # and nothing else. Do NOT reach for QEMU to get there sooner: an
-          # emulated arm64 Rust build is slow, and produces a binary that never
-          # executes on the machine it was measured on.
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # Stamped into the binary so the status page and the startup log name
-          # the build, not just the version.
-          build-args: |
-            NEEWERTV_BUILD=${{ github.sha }}
-          provenance: true
-          sbom: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect
+        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
 
       # A tag publishes a page as well as an image. The notes come from the
       # changelog section for that version, because that is where the writing

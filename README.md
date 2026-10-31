@@ -184,7 +184,9 @@ won't.
 ### 3 — Start it
 
 No build, no toolchain, no compile. The image lives at
-`ghcr.io/hyper-dragon/neewertv`.
+`ghcr.io/hyper-dragon/neewertv`, and it is a multi-arch manifest — `amd64` and
+`arm64` behind the same tag — so a Pi and a mini PC run the same `docker pull` and
+each gets a binary built for itself.
 
 ```bash
 # the example files
@@ -318,8 +320,6 @@ the compose file.
   `BLE_DEVICE_ADDRESS` each. Same model advertises the same name, and the daemon
   refuses to guess which one you meant rather than binding to whichever the scan
   happened to return first. See [docs/NOTES.md](docs/NOTES.md).
-- **No arm64 image yet.** amd64 only, for now. On an ARM host, build your own:
-  `docker build -t neewertv .`
 - **It's a container, not a package.** No `.deb`, no snap, no Home Assistant
   add-on, nothing on a store shelf.
 - **You can run it on the host**, without Docker, if you insist — Rust 1.85+, a
@@ -347,6 +347,11 @@ the compose file.
 
 ## Version History
 
+**v0.1.5** — arm64. The published image is now a multi-arch manifest for
+`linux/amd64` and `linux/arm64`, each half compiled on a runner of its own
+architecture rather than cross-built, so a Pi pulls the same tag and gets a binary
+for the Pi.
+
 **v0.1.4** — reconnect handling. The strip's state is asked for again on every
 connection rather than once per process, a write that is never acknowledged is
 now a counted drop instead of a frozen daemon, and the keep-alive warns when it
@@ -371,8 +376,6 @@ Older detail lives in [CHANGELOG.md](CHANGELOG.md).
 
 ## Future plans
 
-- arm64 images — waiting on this repository being public and the CI minutes that
-  come with it.
 - Custom scenes in a config file, plus an editorial layer to hide or rename the
   built-in effects you never use.
 - Alert *patterns* beyond a flash — a pulse, a slow fade — now that the colour is

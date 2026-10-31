@@ -8,6 +8,27 @@ All notable changes to this project. The format follows
 
 Nothing yet.
 
+## [0.1.5] — 2026-10-31
+
+The repository is public, so the image can now be built for ARM as well — and it
+is built on ARM hardware rather than under emulation.
+
+### Added
+
+- **arm64 images.** `ghcr.io/hyper-dragon/neewertv` is published as a multi-arch
+  manifest — `linux/amd64` and `linux/arm64` behind the same tags. A Pi pulls the
+  tag it always pulled and gets a binary compiled for the Pi; `docker pull` picks
+  the right half by itself, and `docker buildx imagetools inspect` shows both.
+
+### Changed
+
+- **Each architecture is built on a runner of that architecture.** GitHub's arm64
+  hosted runners are free for public repositories, so the ARM half is a native
+  compile with no QEMU in the way: same Dockerfile, same `cargo build`, and a
+  cache scope per platform so the two jobs do not evict each other's layers. A
+  separate merge job puts both digests behind one manifest list, because a tag
+  pointing at a single-architecture image is a lie until it does.
+
 ## [0.1.4] — 2026-10-31
 
 Reconnect handling, written after a strip in the field lost its link three times

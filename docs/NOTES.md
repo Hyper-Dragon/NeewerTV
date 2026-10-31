@@ -21,7 +21,7 @@ after an alert.
 | ✅ | Effects: presets, scenes, DIY patterns, per-segment colour | done |
 | ✅ | Alerts: fire a pattern, then put the strip back | done, verified on hardware |
 | ✅ | Web interface: status page and log tail, read-only | done |
-| ⬜ | arm64 images | waiting on the repository being public |
+| ✅ | Images: `linux/amd64` and `linux/arm64`, each built natively | done |
 
 ## Why this exists at all
 
