@@ -54,9 +54,10 @@ LABEL org.opencontainers.image.title="neewertv" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.source="https://github.com/Hyper-Dragon/NeewerTV"
 
-# ca-certificates covers MQTT over TLS, and libdbus-1-3 is what btleplug links
-# against at runtime. Nothing else is needed: the Bluetooth link arrives over the
-# host's D-Bus socket, which is bind-mounted in.
+# libdbus-1-3 is what btleplug links against at runtime. ca-certificates is kept
+# for the day the MQTT transport grows TLS — nothing in the daemon uses it yet.
+# Nothing else is needed: the Bluetooth link arrives over the host's D-Bus
+# socket, which is bind-mounted in.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates libdbus-1-3 \
  && rm -rf /var/lib/apt/lists/*

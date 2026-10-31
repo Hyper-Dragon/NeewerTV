@@ -22,7 +22,7 @@ it is not one. There is no bounty; there is gratitude.
 
 | Asset | Position |
 |---|---|
-| MQTT credentials | Read from the environment, held in memory, never logged and never written to disk. Prefer `MQTT_PASSWORD_FILE` over `MQTT_PASSWORD` so it is not visible in `docker inspect`. |
+| MQTT credentials | Read from the environment, held in memory, never logged and never written to disk. |
 | Web interface | **No authentication by design** — see below. It is a local observability page: a status readout and the daemon's log tail. It has no route that can change the strip, so an open page is a disclosure question, not a control one. |
 | Logs | Contain command summaries and connection state. They never contain the MQTT password or the broker URI's userinfo. |
 | Persistent storage | The daemon has none. Nothing survives a restart, so there is no store to leak. |
@@ -53,8 +53,10 @@ would make the daemon worse at its job:
 3. **Keep the D-Bus mount as narrow as possible.** The example compose mounts the
    single `system_bus_socket` rather than `/run/dbus`, so a compromised container
    cannot walk away with every other bus on the host.
-4. **Terminate TLS at the broker** if it is off-host. `MQTT_TLS=true` is
-   supported; the certificate bundle comes from the image.
+4. **There is no TLS on the MQTT connection.** The client is left on `rumqttc`'s
+   default TCP transport, so the broker password crosses the network in the
+   clear. Keep the broker on a network you trust, or terminate TLS in front of it
+   and point `MQTT_HOST`/`MQTT_PORT` at a plaintext listener on the other side.
 
 ## The hardware is the weak point, and it is not ours to fix
 
