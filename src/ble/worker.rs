@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 
-use crate::app::alerts::{AlertSpec, Alerts, Beat, Fire};
+use crate::app::alerts::{AlertSpec, Alerts, Beat, Fire, Restore};
 use crate::app::command::{self, Command};
 use crate::app::queue::{Batch, Coalescer};
 use crate::ble::link::{Link, LinkError};
@@ -53,6 +53,15 @@ fn running_effect(report: &StateReport) -> Option<&'static str> {
 
 /// How long to wait for a state report before deciding the link is dead.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long an alert waits for the strip to say what it is showing, once the
+/// alert has had to switch it on.
+///
+/// Short on purpose. A doorbell that flashes six seconds late because the strip
+/// was slow to answer is a worse doorbell than one that flashes in the colour it
+/// guessed and puts back a colour that was nearly right. The answer only improves
+/// the restore; nothing depends on it arriving.
+const ALERT_REPLY_MS: u64 = 400;
 
 /// Attempts made in a row before the worker gives up and lets the caller retry
 /// on its next message. Two is deliberate: the first retry is the one measured
@@ -247,11 +256,19 @@ impl<L: Link> Worker<L> {
                 }
 
                 Message::Alert(spec) => {
-                    // What to put back if this strip was lit but never commanded:
-                    // the colour and brightness it reported when we asked.
-                    let restore = self.uncommanded_restore();
+                    // What to put back, for each state the strip may be in now.
+                    let restore = self.restore_points();
                     match self.alerts.fire_with_restore(&spec, self.now, restore) {
-                        Fire::Fired { frames } => {
+                        Fire::Fired { frames, power_on } => {
+                            if power_on {
+                                // Switch the strip on before anything else. A
+                                // colour frame is not a power frame: an alert that
+                                // skips this flashes at a device that is off, and
+                                // the whole point of `force_on` is that this one is
+                                // allowed to wake the room.
+                                self.power_on_for_alert().await;
+                            }
+
                             if let Err(failure) = self.write_all(&frames).await {
                                 self.snapshot.last_error = Some(failure.error.to_string());
                             }
@@ -545,29 +562,124 @@ impl<L: Link> Worker<L> {
     /// colour — which looks exactly like the alert never ended.
     fn uncommanded_restore(&self) -> Vec<Vec<u8>> {
         let mut frames = vec![wire::power(true)];
+        let presentation = self.presentation_frames();
 
-        match (self.snapshot.colour_hsi, self.snapshot.brightness) {
-            (Some((hue, saturation)), level) => {
-                let level = level.map_or(1000, level_255_to_units);
-                if let Ok(frame) = wire::colour(hue, saturation, level) {
-                    frames.push(frame);
-                }
-            }
-            (None, Some(level)) => {
-                if let Ok(frame) = wire::brightness(level_255_to_units(level)) {
-                    frames.push(frame);
-                }
-            }
+        if presentation.is_empty() {
             // Nothing observed at all. Coming back visible beats coming back
             // dark, and the device will not tell us anything better.
-            (None, None) => {
-                if let Ok(frame) = wire::brightness(1000) {
-                    frames.push(frame);
-                }
+            if let Ok(frame) = wire::brightness(1000) {
+                frames.push(frame);
             }
+        } else {
+            frames.extend(presentation);
         }
 
         frames
+    }
+
+    /// Frames that put back what the strip is showing, and say nothing about
+    /// power.
+    ///
+    /// Split out because the two restores need it in different shapes: a lit strip
+    /// comes back with the power on and the presentation after it, while a dark
+    /// one gets the presentation on its own and then the power going off. Leaving
+    /// a dark strip in the alert's colour is not harmless — the device remembers
+    /// its colour across a power cycle, so that is the colour the room gets the
+    /// next time the light is switched on.
+    fn presentation_frames(&self) -> Vec<Vec<u8>> {
+        match (self.snapshot.colour_hsi, self.snapshot.brightness) {
+            (Some((hue, saturation)), level) => {
+                let level = level.map_or(1000, level_255_to_units);
+                wire::colour(hue, saturation, level)
+                    .map(|frame| vec![frame])
+                    .unwrap_or_default()
+            }
+            (None, Some(level)) => wire::brightness(level_255_to_units(level))
+                .map(|frame| vec![frame])
+                .unwrap_or_default(),
+            (None, None) => Vec::new(),
+        }
+    }
+
+    /// The two restore points an alert may need, before it knows which it wants.
+    fn restore_points(&self) -> Restore {
+        let mut dark = self.presentation_frames();
+        dark.push(wire::power(false));
+
+        Restore {
+            lit: self.uncommanded_restore(),
+            dark,
+        }
+    }
+
+    /// Switch the strip on for an alert, and learn what it came up showing.
+    ///
+    /// The order matters. A powered-off strip shows nothing, so the query has to
+    /// come after the power frame or it describes the dark state the alert is
+    /// about to leave behind. And the query is skipped entirely when the daemon
+    /// already knows the colour from its own last command, because that record is
+    /// better evidence than a re-read — and because a doorbell should not wait for
+    /// a link it does not have to.
+    async fn power_on_for_alert(&mut self) {
+        if let Err(failure) = self.write_all(&[wire::power(true)]).await {
+            self.snapshot.last_error = Some(failure.error.to_string());
+            return;
+        }
+
+        if self.snapshot.colour_hsi.is_some() {
+            return;
+        }
+
+        self.read_presentation(Duration::from_millis(ALERT_REPLY_MS))
+            .await;
+        self.alerts.learn_restore(self.presentation_frames());
+    }
+
+    /// Ask the strip what it is showing, and adopt nothing but the presentation.
+    ///
+    /// Power is deliberately left alone: an alert switches the strip on and then
+    /// off again, and a reading taken in between would publish a light that is not
+    /// there by the time anyone reads it. The colour and brightness are adopted
+    /// under the same rule as everywhere else — only when nothing better is known.
+    async fn read_presentation(&mut self, timeout: Duration) {
+        if let Err(err) = self.link.write(&wire::query_state(true)).await {
+            tracing::debug!(%err, "alert-time state query could not be written");
+            return;
+        }
+        self.last_traffic = self.now;
+
+        match self.link.next_report(timeout).await {
+            Ok(report) => {
+                if self.snapshot.colour_hsi.is_none()
+                    && let Some((hue, saturation)) = report.colour()
+                {
+                    self.snapshot.colour_hsi = Some((hue, saturation));
+                    self.snapshot.colour = Some(hsi_to_rgb(Hsi {
+                        hue,
+                        saturation,
+                        lightness: 100,
+                    }));
+                    tracing::info!(
+                        hue,
+                        saturation,
+                        "learned the colour to restore from the device"
+                    );
+                }
+
+                if self.snapshot.brightness.is_none()
+                    && let Some(percent) = report.diy_brightness_pct()
+                {
+                    let level = units_to_255(u16::from(percent).min(100) * 10);
+                    self.snapshot.brightness = Some(level);
+                    tracing::info!(
+                        percent,
+                        brightness_255 = level,
+                        "learned the brightness to restore from the device"
+                    );
+                }
+            }
+            Err(err) => tracing::debug!(%err, "no answer to the alert-time state query"),
+        }
     }
 
     /// Attach, retrying immediately once.
@@ -1049,6 +1161,140 @@ mod tests {
             ],
             "power on, alert, then restore"
         );
+    }
+
+    #[tokio::test]
+    async fn an_alert_on_a_dark_strip_switches_it_on_first_and_off_again() {
+        // The bug this pins: an alert's frames are a colour and a dim-to-nothing,
+        // and neither wakes a powered-off strip — so the alert flashed at a device
+        // that was not listening and then "restored" it to off, which is exactly
+        // what it had been all along. It has to be switched on first, and the
+        // switch has to be undone when the alert ends.
+        let (link, _) = FakeLink::new(0);
+        let (state, _) = drain_paced(
+            Worker::new(link),
+            vec![
+                Message::Batch(Batch {
+                    commands: vec![Command::Power(false)],
+                }),
+                Message::Alert(AlertSpec {
+                    id: "doorbell".into(),
+                    priority: 50,
+                    duration_ms: 1_000,
+                    force_on: true,
+                    frames: vec![vec![0xAA, 0x01]],
+                }),
+                Message::Tick(2_000),
+            ],
+        )
+        .await;
+
+        let writes = state.lock().unwrap().writes.clone();
+        assert_eq!(writes[0], wire::power(false), "the user switched it off");
+        assert_eq!(
+            writes[1],
+            wire::power(true),
+            "the alert has to wake the strip before it can flash at it"
+        );
+        assert_eq!(writes[2], vec![0xAA, 0x01], "then the alert itself");
+        assert_eq!(
+            writes.last().unwrap(),
+            &wire::power(false),
+            "and the strip goes back to off, because that is where it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alert_learns_what_a_dark_strip_comes_up_showing() {
+        // The device remembers its colour across a power cycle, so an alert that
+        // leaves its own red behind is the colour the room gets the next time the
+        // light is switched on. Nothing was commanded here, so the strip is the
+        // only thing that can say what has to come back.
+        let (link, fake) = FakeLink::new(0);
+        fake.lock().unwrap().report = Some(report_with_colour(true, 119, 100));
+
+        let (state, _) = drain_paced(
+            Worker::new(link),
+            vec![
+                Message::Batch(Batch {
+                    commands: vec![Command::Power(false)],
+                }),
+                Message::Alert(AlertSpec {
+                    id: "red".into(),
+                    priority: 50,
+                    duration_ms: 1_000,
+                    force_on: true,
+                    frames: vec![wire::colour(0, 100, 1000).unwrap()],
+                }),
+                Message::Tick(2_000),
+            ],
+        )
+        .await;
+
+        let writes = state.lock().unwrap().writes.clone();
+        let last = writes.len() - 1;
+        assert_eq!(
+            writes[last - 1],
+            wire::colour(119, 100, 1000).unwrap(),
+            "the strip goes back to the colour it came up showing"
+        );
+        assert_eq!(
+            writes[last],
+            wire::power(false),
+            "and only then is it switched off again"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alert_does_not_ask_a_strip_whose_colour_it_already_knows() {
+        // A doorbell that waits for a round trip it does not need is a doorbell
+        // that flashes late. The daemon's own record of what it commanded is
+        // better evidence than a re-read, so no query goes out at all.
+        let (link, _) = FakeLink::new(0);
+        let (state, _) = drain_paced(
+            Worker::new(link),
+            vec![
+                // The one query this test allows: the connect-time read, which
+                // finds nothing because the fake strip never answers.
+                Message::Tick(0),
+                Message::Batch(Batch {
+                    commands: vec![Command::Colour {
+                        colour: Hsi {
+                            hue: 240,
+                            saturation: 100,
+                            lightness: 100,
+                        },
+                        brightness: 500,
+                    }],
+                }),
+                Message::Batch(Batch {
+                    commands: vec![Command::Power(false)],
+                }),
+                Message::Alert(AlertSpec {
+                    id: "red".into(),
+                    priority: 50,
+                    duration_ms: 1_000,
+                    force_on: true,
+                    frames: vec![wire::colour(0, 100, 1000).unwrap()],
+                }),
+                Message::Tick(2_000),
+            ],
+        )
+        .await;
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.queries, 1,
+            "nothing to learn, so nothing is asked beyond the connect-time read"
+        );
+
+        let last = state.writes.len() - 1;
+        assert_eq!(
+            state.writes[last - 1],
+            wire::colour(240, 100, level_255_to_units(units_to_255(500))).unwrap(),
+            "the colour the user chose comes back"
+        );
+        assert_eq!(state.writes[last], wire::power(false));
     }
 
     #[tokio::test]

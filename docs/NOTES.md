@@ -241,7 +241,9 @@ the things worth checking before a release:
 - [ ] Switch the strip off at the wall mid-effect, then back on.
 - [ ] Hold the connection with the vendor app, then close it: the daemon recovers.
 - [ ] Per-segment colour across all 20 zones.
-- [ ] Fire an alert while the strip is off: it lights up, then goes back off.
+- [ ] Fire an alert while the strip is off: it lights up, then goes back off —
+      and switching it on afterwards shows the colour it had before the alert,
+      not the alert's.
 
 ## Running it without Docker
 

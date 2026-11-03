@@ -28,6 +28,11 @@
 //! alerts it is permanently stuck flashing. The method that records state is
 //! therefore reachable only from a user command, never from [`Alerts::fire`], so
 //! the bug cannot be written by accident.
+//!
+//! [`Alerts::learn_restore`] is the one other writer, and it is deliberately
+//! narrow: only an alert that had to switch the strip on may use it, and what it
+//! accepts is the presentation the *strip* reported — never a frame the alert
+//! painted.
 
 use crate::protocol::command as wire;
 
@@ -54,11 +59,38 @@ pub struct AlertSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fire {
     /// Write these frames.
-    Fired { frames: Vec<Vec<u8>> },
+    Fired {
+        frames: Vec<Vec<u8>>,
+        /// The strip was off, or nothing was known about it, so the alert is
+        /// expected to switch it on first — and therefore to switch it off
+        /// again when it ends.
+        ///
+        /// A colour frame does not wake a powered-off strip, so an alert that
+        /// skips this flashes at a device that is not listening. It is reported
+        /// rather than prepended to `frames` because the repeated flash must not
+        /// re-send it twice a second, and because the caller has one more thing
+        /// to do before flashing: ask the strip what it came up showing.
+        power_on: bool,
+    },
     /// Refused. Counted, not silently ignored: either something at least as
     /// important is already showing, or this alert was not allowed to light a
     /// strip that is not already on.
     Rejected,
+}
+
+/// How to put the strip back, for the two states an alert can start in.
+///
+/// The caller knows things this module does not — the colour the strip reported
+/// and the brightness it reported it at — so it builds both answers and this
+/// module picks the one the alert's own starting state calls for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Restore {
+    /// The strip was lit but had never been commanded: the presentation the
+    /// strip itself reported is the only honest thing to come back to.
+    pub lit: Vec<Vec<u8>>,
+    /// The strip was off, or its state was never established: its presentation,
+    /// then the power going off. Empty means "switch it off and nothing else".
+    pub dark: Vec<Vec<u8>>,
 }
 
 /// An alert currently on screen.
@@ -73,6 +105,9 @@ struct Active {
     next_at_ms: u64,
     /// Exactly what to replay when this ends.
     restore: Vec<Vec<u8>>,
+    /// Whether this alert had to switch the strip on, which is also what decides
+    /// whether [`Alerts::learn_restore`] may revise the restore.
+    started_dark: bool,
 }
 
 /// How often an alert repeats its frames.
@@ -167,23 +202,24 @@ impl Alerts {
 
     /// Show an alert, if it outranks whatever is on screen.
     pub fn fire(&mut self, spec: &AlertSpec, now_ms: u64) -> Fire {
-        self.fire_with_restore(spec, now_ms, vec![wire::power(true), bright()])
+        self.fire_with_restore(
+            spec,
+            now_ms,
+            Restore {
+                lit: vec![wire::power(true), bright()],
+                dark: vec![power_off()],
+            },
+        )
     }
 
-    /// Show an alert, choosing the caller's restore for a strip that was lit but
-    /// never commanded.
+    /// Show an alert, choosing the caller's restore for each starting state.
     ///
     /// The caller knows things this module does not — the colour the strip said it
     /// was showing, and at what brightness — so it gets to decide how to put an
     /// uncommanded strip back. Without that the strip came back at full brightness
     /// in whatever colour the alert had painted it, which reads as the alert never
     /// having ended.
-    pub fn fire_with_restore(
-        &mut self,
-        spec: &AlertSpec,
-        now_ms: u64,
-        uncommanded_restore: Vec<Vec<u8>>,
-    ) -> Fire {
+    pub fn fire_with_restore(&mut self, spec: &AlertSpec, now_ms: u64, restore: Restore) -> Fire {
         // An alert whose deadline has passed but which has not been ticked out
         // yet must not block a new one: the worker ticks on a timer, and a
         // priority check against a dead alert is a coin flip on scheduling.
@@ -211,13 +247,23 @@ impl Alerts {
             return Fire::Rejected;
         }
 
+        // Whether this alert has to switch the strip on, and therefore switch it
+        // off again afterwards. "Never established" counts as dark for exactly
+        // the reason it does in the check above: the daemon does not assume a
+        // strip is lit, and it has just been allowed to light one on a guess.
+        let started_dark = self.last_was_off != Some(false);
+
         // Captured *before* anything else changes, and only ever from a user
         // command — never from whatever happens to be on screen, which may be
         // another alert's frames.
-        let restore = match self.last_was_off {
-            // Known to be off, so putting it back means switching it off. Replaying
-            // a colour to a dark room would leave it lit.
-            Some(true) => vec![power_off()],
+        let restore = if started_dark {
+            // Known to be off, so putting it back means switching it off — but a
+            // colour and a brightness outlive a power cycle, so switch it off
+            // *after* putting the presentation back. Leaving the alert's red in
+            // place would be what the strip shows the next time somebody turns it
+            // on, hours later, with nothing to explain why.
+            restore.dark
+        } else if self.last_frames.is_empty() {
             // Known to be lit, but nothing was ever commanded — the strip was on
             // when we met it, and the state query is the only thing that said so.
             //
@@ -228,11 +274,11 @@ impl Alerts {
             // guess in the direction of "the light is on", and it is the only
             // honest one available — the device does not echo brightness back, so
             // the daemon genuinely has nothing better.
-            Some(false) if self.last_frames.is_empty() => uncommanded_restore,
-            // Known lit, or never established. There is no honest way to rebuild a
-            // colour the daemon never saw, so replay what it last commanded — which
-            // is empty, and therefore a no-op, when it has commanded nothing.
-            _ => self.last_frames.clone(),
+            restore.lit
+        } else {
+            // Known lit and commanded. There is no honest way to rebuild a colour
+            // the daemon never saw, so replay what it last commanded.
+            self.last_frames.clone()
         };
 
         self.active = Some(Active {
@@ -242,12 +288,38 @@ impl Alerts {
             frames: spec.frames.clone(),
             next_at_ms: now_ms.saturating_add(FLASH_PERIOD_MS),
             restore,
+            started_dark,
         });
         self.fired += 1;
 
         Fire::Fired {
             frames: spec.frames.clone(),
+            power_on: started_dark,
         }
+    }
+
+    /// Revise the restore of a running alert with what the strip turned out to be
+    /// showing.
+    ///
+    /// Only an alert that switched the strip on can use this. Such an alert has
+    /// to ask the strip what it came up displaying, and the answer arrives after
+    /// the alert has already started — so the restore it fired with was a guess
+    /// built from whatever the daemon knew, and this is the correction.
+    ///
+    /// An alert on a lit strip is deliberately untouched: its restore is the
+    /// user's last command, and a reading must not overwrite that.
+    pub fn learn_restore(&mut self, presentation: Vec<Vec<u8>>) {
+        let Some(active) = &mut self.active else {
+            return;
+        };
+
+        if !active.started_dark {
+            return;
+        }
+
+        let mut restore = presentation;
+        restore.push(power_off());
+        active.restore = restore;
     }
 
     /// Advance time: repeat the flash, or finish and hand back the restore.
@@ -379,11 +451,45 @@ mod tests {
         assert_eq!(
             alerts.fire(&alert, 0),
             Fire::Fired {
-                frames: vec![vec![0x01], vec![0x02]]
+                frames: vec![vec![0x01], vec![0x02]],
+                power_on: true,
             }
         );
         assert!(alerts.is_active());
         assert_eq!(alerts.counters(), (1, 0));
+    }
+
+    #[test]
+    fn an_alert_on_a_lit_strip_does_not_switch_it_on() {
+        // The strip is already lit; a power frame on every flash would be noise
+        // on the link twice a second for no change.
+        let mut alerts = Alerts::new();
+        alerts.user_command(vec![vec![0x10]], false);
+
+        assert_eq!(
+            alerts.fire(&normal("doorbell", vec![vec![0xAA]]), 0),
+            Fire::Fired {
+                frames: vec![vec![0xAA]],
+                power_on: false,
+            }
+        );
+    }
+
+    #[test]
+    fn an_alert_on_a_dark_strip_asks_to_be_switched_on() {
+        // The bug this pins, from life: a colour frame does not wake a
+        // powered-off strip, so an alert fired at one wrote two frames to a
+        // device that was not listening and looked like nothing happened.
+        let mut alerts = Alerts::new();
+        alerts.user_command(vec![power_off()], true);
+
+        assert_eq!(
+            alerts.fire(&normal("doorbell", vec![vec![0xAA]]), 0),
+            Fire::Fired {
+                frames: vec![vec![0xAA]],
+                power_on: true,
+            }
+        );
     }
 
     #[test]
@@ -443,10 +549,67 @@ mod tests {
         assert_eq!(
             alerts.fire(&alert, 0),
             Fire::Fired {
-                frames: vec![vec![0xAA]]
+                frames: vec![vec![0xAA]],
+                power_on: false,
             },
             "nothing is being woken, so there is nothing to refuse"
         );
+    }
+
+    #[test]
+    fn a_dark_strips_restore_comes_back_to_its_presentation_first() {
+        // The device remembers its colour across a power cycle, so a restore of
+        // `power(false)` alone leaves the alert's own colour behind — and that is
+        // what the room gets the next time the light is switched on, hours later,
+        // with nothing to explain why.
+        let mut alerts = Alerts::new();
+        alerts.user_command(vec![power_off()], true);
+
+        let mut alert = normal("doorbell", vec![vec![0xAA]]);
+        alert.force_on = true;
+        alerts.fire_with_restore(
+            &alert,
+            0,
+            Restore {
+                lit: vec![vec![0xDD]],
+                dark: vec![vec![0xCC], power_off()],
+            },
+        );
+
+        assert_eq!(
+            alerts.tick(1_000).expect("ended"),
+            vec![vec![0xCC], power_off()],
+            "presentation first, then the power going off"
+        );
+    }
+
+    #[test]
+    fn a_restore_learned_mid_alert_replaces_a_dark_alerts_guess() {
+        // The alert fired before the strip had answered, so its restore was built
+        // from what the daemon happened to know. What the strip says it is
+        // showing outranks that, and has to survive to the end of the alert.
+        let mut alerts = Alerts::new();
+        alerts.fire(&normal("doorbell", vec![vec![0xAA]]), 0);
+
+        alerts.learn_restore(vec![vec![0xCC]]);
+
+        assert_eq!(
+            alerts.tick(1_000).expect("ended"),
+            vec![vec![0xCC], power_off()]
+        );
+    }
+
+    #[test]
+    fn a_restore_learned_mid_alert_leaves_a_lit_strips_restore_alone() {
+        // A lit strip's restore is the user's own last command. A reading taken
+        // mid-alert describes the alert, not the strip, and must not replace it.
+        let mut alerts = Alerts::new();
+        alerts.user_command(vec![vec![0x10]], false);
+        alerts.fire(&normal("doorbell", vec![vec![0xAA]]), 0);
+
+        alerts.learn_restore(vec![vec![0xCC]]);
+
+        assert_eq!(alerts.tick(1_000).expect("ended"), vec![vec![0x10]]);
     }
 
     #[test]
@@ -541,7 +704,8 @@ mod tests {
         assert_eq!(
             alerts.fire(&spec("doorbell", 50), 500),
             Fire::Fired {
-                frames: vec![vec![0xAA, 0x01]]
+                frames: vec![vec![0xAA, 0x01]],
+                power_on: false,
             }
         );
 

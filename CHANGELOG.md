@@ -6,7 +6,29 @@ All notable changes to this project. The format follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **An alert fired at a strip that was off flashed at a device that was not
+  listening.** Every alert frame was a colour and a dim-to-nothing, and neither
+  wakes a powered-off strip — so the flash never reached the room, and the
+  restore that followed (`power(false)`) was the state the strip had been in all
+  along. An alert now switches the strip on first, once, before the first flash.
+- **An alert left its own colour behind on a strip it had switched on.** The
+  device remembers its colour across a power cycle, so a red alert was still red
+  the next time somebody turned the light on — hours later, with nothing to
+  explain why. A strip that was off has its colour and brightness put back before
+  the power goes off again.
+
+### Changed
+
+- **An alert asks the strip what it is showing before flashing at it**, bounded at
+  400 ms and skipped entirely when the daemon already knows the colour from its
+  own last command. That answer, not a guess, is what the restore replays.
+- **A `feat/`, `fix/` or `test/` branch publishes a `test` image.** The
+  `test-image` workflow builds the same multi-arch manifest as a release and tags
+  it `test` and `test-<sha>`; `latest`, `edge` and every version tag still come
+  only from the release job, so a branch build can be pulled onto a strip without
+  disturbing anything already running the mainline.
 
 ## [0.1.5] — 2026-10-31
 

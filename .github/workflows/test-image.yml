@@ -1,0 +1,140 @@
+name: test image
+
+# A second image, built from a branch, that leaves the release alone.
+#
+# `latest`, `edge` and every version tag stay exactly where they are: this
+# publishes `test` and `test-<sha>` beside them, so a box that pulls `latest`
+# keeps running the mainline build while another can be pointed at `test` to try
+# a change on the real strip. Same multi-arch manifest as a release — both halves
+# built on native runners, never under QEMU — and deliberately the same package,
+# because a new package would arrive private and unpullable.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "feat/**"
+      - "fix/**"
+      - "test/**"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: hyper-dragon/neewertv
+
+# A branch pushed twice in a minute should not leave two test images racing for
+# the same manifest. The older run is the one with nothing left to say.
+concurrency:
+  group: test-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── build ──────────────────────────────────────────────────────────────────
+  # One job per architecture, each on a runner of that architecture, each
+  # pushing a single-arch image *by digest*. Nothing is tagged here; the merge
+  # job below is the only place that knows what the tags are.
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          # Stamped into the binary, so the status page and the startup log name
+          # the branch build rather than the last release.
+          build-args: |
+            NEEWERTV_BUILD=${{ github.sha }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          provenance: true
+          sbom: true
+          # The same cache scopes as the release build: a test image is a rebuild
+          # of the same layers, and sharing the scope means it does not start
+          # from nothing.
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── merge ──────────────────────────────────────────────────────────────────
+  # Puts both digests behind one manifest list and gives it the test tags. No
+  # `latest`, no `edge`, no semver: those belong to the release job and a branch
+  # must never be able to publish one.
+  merge:
+    name: publish test image
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Create manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test" \
+            -t "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test-${GITHUB_SHA::7}" \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect
+        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test
+
+      - name: Summary
+        run: |
+          {
+            echo "### Test image"
+            echo
+            echo '```'
+            echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test"
+            echo '```'
+            echo
+            echo "Built from \`${GITHUB_REF_NAME}\` at \`${GITHUB_SHA::7}\`. The release tags are untouched."
+          } >> "$GITHUB_STEP_SUMMARY"
