@@ -250,9 +250,10 @@ data:
 ```
 
 A strip that is off is switched on for the alert and switched off again
-afterwards, and its colour and brightness go back before the power does — the
-device remembers both across a power cycle, so an alert that left its own colour
-behind would be what the light comes on as the next time you use it.
+afterwards, and what it was showing goes back before the power does — a colour,
+a brightness or a running effect. The device remembers all three across a power
+cycle, so an alert that left its own colour behind would be what the light comes
+on as the next time you use it.
 
 The colours are a fixed, short list, because a signal that needs a reference
 chart isn't one: `red`, `orange`, `yellow`, `lime`, `green`, `cyan`, `blue`,

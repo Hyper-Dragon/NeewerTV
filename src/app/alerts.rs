@@ -108,6 +108,9 @@ struct Active {
     /// Whether this alert had to switch the strip on, which is also what decides
     /// whether [`Alerts::learn_restore`] may revise the restore.
     started_dark: bool,
+    /// Whether `restore` was built from an observation rather than replayed from a
+    /// user command, which is what decides whether a later reading may replace it.
+    restore_observed: bool,
 }
 
 /// How often an alert repeats its frames.
@@ -136,6 +139,16 @@ pub struct Alerts {
     active: Option<Active>,
     /// Frames of the last *user* command.
     last_frames: Vec<Vec<u8>>,
+    /// Frames of the last user command that described what the strip *shows* — a
+    /// colour, an effect, a pattern — with the power frames left out.
+    ///
+    /// Kept apart from [`Self::last_frames`] because a power command overwrites
+    /// that one, and a strip that is switched off still remembers what it was
+    /// showing. Without this an alert on a dark strip could only restore a colour
+    /// it happened to know, which puts the device into colour mode: the effect it
+    /// was running is gone for good, even though the same strip left alone would
+    /// have come back running it.
+    last_presentation: Vec<Vec<u8>>,
     /// Whether the strip was off at the time of that command.
     ///
     /// `None` means nobody has established it: no command has been sent and the
@@ -175,11 +188,34 @@ impl Alerts {
     /// applied and the alert's restore is discarded, because restoring it would
     /// undo something they just asked for.
     ///
+    /// `presentation` is the same command with the power frames taken out — what
+    /// the strip is now *showing*. An empty one leaves the previous record alone,
+    /// because a command that only said "off" says nothing about the colour and a
+    /// strip keeps showing that colour while it is dark.
+    ///
     /// Returns whether an alert was cancelled.
-    pub fn user_command(&mut self, frames: Vec<Vec<u8>>, was_off: bool) -> bool {
+    pub fn user_command(
+        &mut self,
+        frames: Vec<Vec<u8>>,
+        presentation: Vec<Vec<u8>>,
+        was_off: bool,
+    ) -> bool {
         self.last_frames = frames;
         self.last_was_off = Some(was_off);
+        if !presentation.is_empty() {
+            self.last_presentation = presentation;
+        }
         self.active.take().is_some()
+    }
+
+    /// Whether the daemon knows what the strip was showing, from its own record.
+    ///
+    /// True means an alert has nothing to learn from the strip before it flashes:
+    /// the frames to put back are already known exactly, including an effect's
+    /// own parameters, which a reading could only approximate.
+    #[must_use]
+    pub fn knows_presentation(&self) -> bool {
+        !self.last_presentation.is_empty()
     }
 
     /// Whether anything is known about what the strip was doing.
@@ -256,13 +292,25 @@ impl Alerts {
         // Captured *before* anything else changes, and only ever from a user
         // command — never from whatever happens to be on screen, which may be
         // another alert's frames.
-        let restore = if started_dark {
-            // Known to be off, so putting it back means switching it off — but a
-            // colour and a brightness outlive a power cycle, so switch it off
-            // *after* putting the presentation back. Leaving the alert's red in
-            // place would be what the strip shows the next time somebody turns it
-            // on, hours later, with nothing to explain why.
-            restore.dark
+        let (restore, restore_observed) = if started_dark {
+            if self.last_presentation.is_empty() {
+                // Nothing was ever commanded, so the strip is the only thing that
+                // can say what it was showing. The caller's frames come from
+                // asking it, and [`Self::learn_restore`] may replace them with a
+                // better answer once the alert has switched the strip on.
+                (restore.dark, true)
+            } else {
+                // Known to be off, so putting it back means switching it off — but
+                // a colour, a brightness and an effect all outlive a power cycle,
+                // so put the presentation back *first*. Replaying the recorded
+                // frames rather than a colour is what keeps an effect an effect:
+                // the alert's own colour frame would otherwise leave the strip in
+                // colour mode, and the pattern the room had been watching would be
+                // gone the next time the light was switched on.
+                let mut frames = self.last_presentation.clone();
+                frames.push(power_off());
+                (frames, false)
+            }
         } else if self.last_frames.is_empty() {
             // Known to be lit, but nothing was ever commanded — the strip was on
             // when we met it, and the state query is the only thing that said so.
@@ -274,11 +322,11 @@ impl Alerts {
             // guess in the direction of "the light is on", and it is the only
             // honest one available — the device does not echo brightness back, so
             // the daemon genuinely has nothing better.
-            restore.lit
+            (restore.lit, true)
         } else {
             // Known lit and commanded. There is no honest way to rebuild a colour
             // the daemon never saw, so replay what it last commanded.
-            self.last_frames.clone()
+            (self.last_frames.clone(), false)
         };
 
         self.active = Some(Active {
@@ -289,6 +337,7 @@ impl Alerts {
             next_at_ms: now_ms.saturating_add(FLASH_PERIOD_MS),
             restore,
             started_dark,
+            restore_observed,
         });
         self.fired += 1;
 
@@ -307,13 +356,15 @@ impl Alerts {
     /// built from whatever the daemon knew, and this is the correction.
     ///
     /// An alert on a lit strip is deliberately untouched: its restore is the
-    /// user's last command, and a reading must not overwrite that.
+    /// user's last command, and a reading must not overwrite that. The same goes
+    /// for a dark strip whose presentation the daemon already knew — a recorded
+    /// effect carries its own parameters, which a reading can only approximate.
     pub fn learn_restore(&mut self, presentation: Vec<Vec<u8>>) {
         let Some(active) = &mut self.active else {
             return;
         };
 
-        if !active.started_dark {
+        if !active.restore_observed {
             return;
         }
 
@@ -464,7 +515,7 @@ mod tests {
         // The strip is already lit; a power frame on every flash would be noise
         // on the link twice a second for no change.
         let mut alerts = Alerts::new();
-        alerts.user_command(vec![vec![0x10]], false);
+        alerts.user_command(vec![vec![0x10]], vec![vec![0x10]], false);
 
         assert_eq!(
             alerts.fire(&normal("doorbell", vec![vec![0xAA]]), 0),
@@ -481,7 +532,7 @@ mod tests {
         // powered-off strip, so an alert fired at one wrote two frames to a
         // device that was not listening and looked like nothing happened.
         let mut alerts = Alerts::new();
-        alerts.user_command(vec![power_off()], true);
+        alerts.user_command(vec![power_off()], vec![], true);
 
         assert_eq!(
             alerts.fire(&normal("doorbell", vec![vec![0xAA]]), 0),
@@ -495,7 +546,11 @@ mod tests {
     #[test]
     fn the_strip_returns_to_exactly_what_it_was_doing() {
         let mut alerts = Alerts::new();
-        alerts.user_command(vec![vec![0x10], vec![0x11]], false);
+        alerts.user_command(
+            vec![vec![0x10], vec![0x11]],
+            vec![vec![0x10], vec![0x11]],
+            false,
+        );
         alerts.fire(&normal("doorbell", vec![vec![0xAA]]), 0);
 
         let restore = alerts.tick(1_000).expect("the alert should have ended");
@@ -511,7 +566,7 @@ mod tests {
     fn an_alert_that_forced_the_strip_on_restores_it_off() {
         let mut alerts = Alerts::new();
         // The strip was off when the alert arrived.
-        alerts.user_command(vec![power_off()], true);
+        alerts.user_command(vec![power_off()], vec![], true);
 
         let mut alert = normal("doorbell", vec![vec![0xAA]]);
         alert.force_on = true;
@@ -529,7 +584,7 @@ mod tests {
         // The whole point of the flag: a dishwasher notification is not worth
         // lighting the room for at night, and the caller says so.
         let mut alerts = Alerts::new();
-        alerts.user_command(vec![power_off()], true);
+        alerts.user_command(vec![power_off()], vec![], true);
 
         let mut alert = normal("dishwasher", vec![vec![0xAA]]);
         alert.force_on = false;
@@ -541,7 +596,7 @@ mod tests {
     #[test]
     fn an_alert_that_does_not_force_on_still_shows_on_a_lit_strip() {
         let mut alerts = Alerts::new();
-        alerts.user_command(vec![vec![0x10]], false);
+        alerts.user_command(vec![vec![0x10]], vec![vec![0x10]], false);
 
         let mut alert = normal("dishwasher", vec![vec![0xAA]]);
         alert.force_on = false;
@@ -563,7 +618,7 @@ mod tests {
         // what the room gets the next time the light is switched on, hours later,
         // with nothing to explain why.
         let mut alerts = Alerts::new();
-        alerts.user_command(vec![power_off()], true);
+        alerts.user_command(vec![power_off()], vec![], true);
 
         let mut alert = normal("doorbell", vec![vec![0xAA]]);
         alert.force_on = true;
@@ -580,6 +635,77 @@ mod tests {
             alerts.tick(1_000).expect("ended"),
             vec![vec![0xCC], power_off()],
             "presentation first, then the power going off"
+        );
+    }
+
+    #[test]
+    fn a_dark_strip_replays_what_it_was_showing_rather_than_a_colour() {
+        // The device keeps its mode across a power cycle, so a strip left alone
+        // was going to come back running its effect. An alert paints over that
+        // with a colour frame, and a restore built from a colour leaves the strip
+        // in colour mode — the effect is gone for good, even though the strip had
+        // remembered it. Replaying the recorded frames is what keeps it an effect.
+        let mut alerts = Alerts::new();
+        alerts.user_command(vec![vec![0xE0], power_off()], vec![vec![0xE0]], true);
+
+        let mut alert = normal("doorbell", vec![vec![0xAA]]);
+        alert.force_on = true;
+        alerts.fire_with_restore(
+            &alert,
+            0,
+            Restore {
+                lit: vec![vec![0xDD]],
+                dark: vec![vec![0xCC], power_off()],
+            },
+        );
+
+        assert_eq!(
+            alerts.tick(1_000).expect("ended"),
+            vec![vec![0xE0], power_off()],
+            "the recorded frames, not the observed colour, and then off"
+        );
+    }
+
+    #[test]
+    fn a_power_command_does_not_forget_what_the_strip_was_showing() {
+        // `{"state":"OFF"}` says nothing about the colour, and a strip keeps
+        // showing it while dark — so the presentation has to survive the command
+        // that switched the light off, or the next alert can only put back a
+        // colour it guessed.
+        let mut alerts = Alerts::new();
+        alerts.user_command(vec![vec![0xE0]], vec![vec![0xE0]], false);
+        alerts.user_command(vec![power_off()], vec![], true);
+
+        let mut alert = normal("doorbell", vec![vec![0xAA]]);
+        alert.force_on = true;
+        alerts.fire(&alert, 0);
+
+        assert_eq!(
+            alerts.tick(1_000).expect("ended"),
+            vec![vec![0xE0], power_off()],
+            "the effect comes back before the power goes off"
+        );
+    }
+
+    #[test]
+    fn a_restore_learned_mid_alert_does_not_replace_a_recorded_presentation() {
+        // The daemon knows exactly what it told the strip to run; a reading can
+        // only approximate it — an effect's speed is not in the report — so it
+        // must not be allowed to replace the recording.
+        let mut alerts = Alerts::new();
+        alerts.user_command(vec![vec![0xE0]], vec![vec![0xE0]], false);
+        alerts.user_command(vec![power_off()], vec![], true);
+
+        let mut alert = normal("doorbell", vec![vec![0xAA]]);
+        alert.force_on = true;
+        alerts.fire(&alert, 0);
+
+        assert!(alerts.knows_presentation());
+        alerts.learn_restore(vec![vec![0xCC]]);
+
+        assert_eq!(
+            alerts.tick(1_000).expect("ended"),
+            vec![vec![0xE0], power_off()]
         );
     }
 
@@ -604,7 +730,7 @@ mod tests {
         // A lit strip's restore is the user's own last command. A reading taken
         // mid-alert describes the alert, not the strip, and must not replace it.
         let mut alerts = Alerts::new();
-        alerts.user_command(vec![vec![0x10]], false);
+        alerts.user_command(vec![vec![0x10]], vec![vec![0x10]], false);
         alerts.fire(&normal("doorbell", vec![vec![0xAA]]), 0);
 
         alerts.learn_restore(vec![vec![0xCC]]);
@@ -665,7 +791,7 @@ mod tests {
         // A reconnect must not overwrite the daemon's own record with a stale read.
         let mut alerts = Alerts::new();
         alerts.observe_power(false);
-        alerts.user_command(vec![vec![0x10]], false);
+        alerts.user_command(vec![vec![0x10]], vec![vec![0x10]], false);
         alerts.observe_power(false);
 
         alerts.fire(&normal("doorbell", vec![vec![0xAA]]), 0);
@@ -698,7 +824,7 @@ mod tests {
     #[test]
     fn a_higher_priority_alert_pre_empts_and_restarts_the_clock() {
         let mut alerts = Alerts::new();
-        alerts.user_command(vec![vec![0x10]], false);
+        alerts.user_command(vec![vec![0x10]], vec![vec![0x10]], false);
 
         alerts.fire(&spec("dishwasher", 10), 0);
         assert_eq!(
@@ -718,11 +844,11 @@ mod tests {
     #[test]
     fn a_user_command_cancels_without_replaying() {
         let mut alerts = Alerts::new();
-        alerts.user_command(vec![vec![0x10]], false);
+        alerts.user_command(vec![vec![0x10]], vec![vec![0x10]], false);
         alerts.fire(&normal("doorbell", vec![vec![0xAA]]), 0);
 
         // Someone changes the colour mid-alert.
-        let cancelled = alerts.user_command(vec![vec![0x20]], false);
+        let cancelled = alerts.user_command(vec![vec![0x20]], vec![vec![0x20]], false);
         assert!(
             cancelled,
             "the caller may want to know an alert was cut short"
@@ -736,7 +862,7 @@ mod tests {
     #[test]
     fn cancelling_with_replay_puts_the_strip_back() {
         let mut alerts = Alerts::new();
-        alerts.user_command(vec![vec![0x10]], false);
+        alerts.user_command(vec![vec![0x10]], vec![vec![0x10]], false);
         alerts.fire(&normal("doorbell", vec![vec![0xAA]]), 0);
 
         assert_eq!(alerts.cancel(true), Some(vec![vec![0x10]]));
@@ -746,7 +872,7 @@ mod tests {
     #[test]
     fn cancelling_without_replay_leaves_the_strip_alone() {
         let mut alerts = Alerts::new();
-        alerts.user_command(vec![vec![0x10]], false);
+        alerts.user_command(vec![vec![0x10]], vec![vec![0x10]], false);
         alerts.fire(&normal("doorbell", vec![vec![0xAA]]), 0);
 
         assert_eq!(alerts.cancel(false), None);
@@ -759,7 +885,7 @@ mod tests {
         // screen, the second alert would restore to the first one and the strip
         // would never come back.
         let mut alerts = Alerts::new();
-        alerts.user_command(vec![vec![0x10]], false);
+        alerts.user_command(vec![vec![0x10]], vec![vec![0x10]], false);
 
         alerts.fire(&normal("first", vec![vec![0xA1]]), 0);
         alerts.fire(&normal("second", vec![vec![0xA2]]), 2_000);

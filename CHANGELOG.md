@@ -18,6 +18,15 @@ All notable changes to this project. The format follows
   the next time somebody turned the light on — hours later, with nothing to
   explain why. A strip that was off has its colour and brightness put back before
   the power goes off again.
+- **An alert erased the effect a strip was running.** An effect survives a power
+  cycle, so a strip left alone comes back running it — but an alert's restore only
+  knew a colour, and writing that puts the device into colour mode: the effect was
+  gone for good while Home Assistant went on listing it as selected, and picking
+  it again did nothing because Home Assistant had nothing new to send. The
+  presentation is now recorded separately from the power state, so a strip that
+  was switched off is put back into the exact frames it was showing — an effect,
+  a pattern or a colour — before the power goes off. When nothing was ever
+  commanded the alert asks the strip, and rebuilds the effect it names.
 
 ### Changed
 

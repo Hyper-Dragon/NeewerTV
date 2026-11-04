@@ -242,8 +242,8 @@ the things worth checking before a release:
 - [ ] Hold the connection with the vendor app, then close it: the daemon recovers.
 - [ ] Per-segment colour across all 20 zones.
 - [ ] Fire an alert while the strip is off: it lights up, then goes back off —
-      and switching it on afterwards shows the colour it had before the alert,
-      not the alert's.
+      and switching it on afterwards shows what it had before the alert, colour
+      or effect, not the alert's.
 
 ## Running it without Docker
 

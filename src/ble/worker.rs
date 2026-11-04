@@ -504,9 +504,20 @@ impl<L: Link> Worker<L> {
 
         // Encoding a command is deterministic: if it fails it will fail again, so
         // this batch is not worth retrying and the error is the honest outcome.
+        //
+        // The presentation is the same frames with the power commands left out:
+        // what the strip is now *showing*. It is recorded separately because a
+        // colour and an effect both outlive a power cycle, so a strip that is
+        // switched off still has a presentation — and only these frames say
+        // which, since `{"state":"OFF"}` carries none.
         let mut frames = Vec::new();
+        let mut presentation = Vec::new();
         for command in &batch.commands {
-            frames.extend(command::frames(command)?);
+            let encoded = command::frames(command)?;
+            if !matches!(command, Command::Power(_)) {
+                presentation.extend(encoded.iter().cloned());
+            }
+            frames.extend(encoded);
         }
 
         if let Err(failure) = self.write_all(&frames).await {
@@ -550,7 +561,7 @@ impl<L: Link> Worker<L> {
 
         // Recording happens only for user commands, never for an alert's own
         // frames — otherwise the restore point would erase itself.
-        self.alerts.user_command(restore, was_off);
+        self.alerts.user_command(restore, presentation, was_off);
         Ok(())
     }
 
@@ -587,6 +598,10 @@ impl<L: Link> Worker<L> {
     /// its colour across a power cycle, so that is the colour the room gets the
     /// next time the light is switched on.
     fn presentation_frames(&self) -> Vec<Vec<u8>> {
+        if let Some(frames) = self.effect_frames() {
+            return frames;
+        }
+
         match (self.snapshot.colour_hsi, self.snapshot.brightness) {
             (Some((hue, saturation)), level) => {
                 let level = level.map_or(1000, level_255_to_units);
@@ -599,6 +614,35 @@ impl<L: Link> Worker<L> {
                 .unwrap_or_default(),
             (None, None) => Vec::new(),
         }
+    }
+
+    /// Rebuild the effect the daemon believes is running, when the catalogue says
+    /// how.
+    ///
+    /// Only the families whose frames are fully determined by an identifier are
+    /// rebuilt: a preset, a scene and screen sync are an id, a brightness and a
+    /// direction, all of which the daemon has. A DIY pattern is an id plus a
+    /// palette the user chose, and that palette is in neither the report nor the
+    /// catalogue — rebuilding it would animate the right pattern in the wrong
+    /// colours, which is worse than the colour it would otherwise restore.
+    fn effect_frames(&self) -> Option<Vec<Vec<u8>>> {
+        let effect = catalogue::by_name(self.snapshot.effect.as_deref()?)?;
+        if !matches!(effect.kind, Kind::Preset | Kind::Scene | Kind::TwoWay) {
+            return None;
+        }
+
+        let brightness = self.snapshot.brightness.map_or(1000, level_255_to_units);
+
+        // The speed is the one parameter the daemon never records — a payload
+        // that names an effect may also set one, and the report does not carry it
+        // back. Mid-range is the catalogue's own answer for "not supplied", and
+        // a pattern at the wrong speed still beats the wrong pattern.
+        command::frames(&Command::Effect {
+            effect,
+            brightness,
+            speed: command::DEFAULT_SPEED,
+        })
+        .ok()
     }
 
     /// The two restore points an alert may need, before it knows which it wants.
@@ -617,16 +661,17 @@ impl<L: Link> Worker<L> {
     /// The order matters. A powered-off strip shows nothing, so the query has to
     /// come after the power frame or it describes the dark state the alert is
     /// about to leave behind. And the query is skipped entirely when the daemon
-    /// already knows the colour from its own last command, because that record is
-    /// better evidence than a re-read — and because a doorbell should not wait for
-    /// a link it does not have to.
+    /// already knows what the strip was showing — from its own last command, or
+    /// from a reading taken earlier — because that record is better evidence than
+    /// a re-read, and because a doorbell should not wait for a link it does not
+    /// have to.
     async fn power_on_for_alert(&mut self) {
         if let Err(failure) = self.write_all(&[wire::power(true)]).await {
             self.snapshot.last_error = Some(failure.error.to_string());
             return;
         }
 
-        if self.snapshot.colour_hsi.is_some() {
+        if self.alerts.knows_presentation() || self.snapshot.colour_hsi.is_some() {
             return;
         }
 
@@ -675,6 +720,21 @@ impl<L: Link> Worker<L> {
                         percent,
                         brightness_255 = level,
                         "learned the brightness to restore from the device"
+                    );
+                }
+
+                // The effect it came up running, if any. This is the one that
+                // matters most: an effect is what a strip carries across a power
+                // cycle, so a restore that answers with a colour quietly erases it
+                // — and the daemon would go on publishing the effect name, which
+                // is the other half of the same lie.
+                if self.snapshot.effect.is_none()
+                    && let Some(name) = running_effect(&report)
+                {
+                    self.snapshot.effect = Some(name.to_owned());
+                    tracing::info!(
+                        effect = name,
+                        "learned the effect to restore from the device"
                     );
                 }
             }
@@ -1246,6 +1306,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_alert_puts_back_the_effect_a_dark_strip_was_running() {
+        // The strip keeps its mode across a power cycle, so switching it off while
+        // an effect runs and back on brings the effect back. An alert that puts
+        // back *a colour* breaks that for good — the effect is gone, and Home
+        // Assistant goes on listing it as selected. The frames the user asked for
+        // are what has to come back, and they are known exactly, so nothing is
+        // asked of the strip either.
+        let (link, _) = FakeLink::new(0);
+        let effect = catalogue::by_name("Starstream").expect("in the catalogue");
+        let (state, _) = drain_paced(
+            Worker::new(link),
+            vec![
+                Message::Batch(Batch {
+                    commands: vec![Command::Effect {
+                        effect,
+                        brightness: 800,
+                        speed: 50,
+                    }],
+                }),
+                Message::Batch(Batch {
+                    commands: vec![Command::Power(false)],
+                }),
+                Message::Alert(AlertSpec {
+                    id: "red".into(),
+                    priority: 50,
+                    duration_ms: 1_000,
+                    force_on: true,
+                    frames: vec![wire::colour(0, 100, 1000).unwrap()],
+                }),
+                Message::Tick(2_000),
+            ],
+        )
+        .await;
+
+        let state = state.lock().unwrap();
+        let last = state.writes.len() - 1;
+        assert_eq!(
+            state.writes[last - 1],
+            wire::preset(0xFB, 800, 50).expect("valid preset"),
+            "the effect comes back, at the brightness it was running at"
+        );
+        assert_eq!(
+            state.writes[last],
+            wire::power(false),
+            "and then the strip goes off"
+        );
+        assert_eq!(
+            state.queries, 1,
+            "the only query is the connect-time read: the effect is already known"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alert_restores_the_effect_the_strip_reported() {
+        // Nothing was ever commanded, so the strip's own answer is all there is —
+        // and it names the effect it is running, which is enough to ask for it
+        // again. Without this the strip came back as a flat colour while Home
+        // Assistant went on listing the effect as selected.
+        let (link, fake) = FakeLink::new(0);
+        fake.lock().unwrap().report = Some(report_with_scene(true, 3, 0x31));
+
+        let state = drain(
+            Worker::new(link),
+            vec![
+                Message::Tick(0),
+                Message::Alert(AlertSpec {
+                    id: "red".into(),
+                    priority: 50,
+                    duration_ms: 1_000,
+                    force_on: true,
+                    frames: vec![wire::colour(0, 100, 1000).unwrap()],
+                }),
+                Message::Tick(2_000),
+            ],
+        )
+        .await;
+
+        let writes = state.lock().unwrap().writes.clone();
+        assert_eq!(
+            writes.last().unwrap(),
+            &wire::effect(0x31, 1000, 50, 0x00, 0x00, 0x01, &[(100, 0, 63)]).expect("valid scene"),
+            "Icelandic Blue goes back on, not a colour standing in for it"
+        );
+        assert_eq!(
+            writes[writes.len() - 2],
+            wire::power(true),
+            "and the strip stays on, because that is how it was found"
+        );
+    }
+
+    #[tokio::test]
     async fn an_alert_does_not_ask_a_strip_whose_colour_it_already_knows() {
         // A doorbell that waits for a round trip it does not need is a doorbell
         // that flashes late. The daemon's own record of what it commanded is
@@ -1291,8 +1442,9 @@ mod tests {
         let last = state.writes.len() - 1;
         assert_eq!(
             state.writes[last - 1],
-            wire::colour(240, 100, level_255_to_units(units_to_255(500))).unwrap(),
-            "the colour the user chose comes back"
+            wire::colour(240, 100, 500).unwrap(),
+            "the colour the user chose comes back, at the brightness they chose — \
+             replayed as recorded, not round-tripped through the 0–255 scale"
         );
         assert_eq!(state.writes[last], wire::power(false));
     }

@@ -122,7 +122,11 @@ pub struct HsiEntry {
 
 /// Default animation speed when a caller does not supply one: mid-range, which
 /// is the only defensible guess for a value with no neutral.
-const DEFAULT_SPEED: u8 = 50;
+///
+/// Public because a restore that has to rebuild an effect from its name — an
+/// alert putting back what the strip was running — has no payload to take a
+/// speed from.
+pub const DEFAULT_SPEED: u8 = 50;
 
 /// Resolve a payload into the commands to send, in order.
 ///
