@@ -6,6 +6,15 @@ All notable changes to this project. The format follows
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.6] — 2026-11-04
+
+An alert fired at a strip that was switched off used to flash at a device that was
+not listening, and the restore that followed was the state it had been in all
+along. It now switches the strip on, flashes, and puts it back — including what it
+was showing, which outlives a power cycle.
+
 ### Fixed
 
 - **An alert fired at a strip that was off flashed at a device that was not

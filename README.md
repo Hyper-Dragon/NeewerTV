@@ -374,6 +374,12 @@ the compose file.
 
 ## Version History
 
+**v0.1.6** — alerts on a dark strip. An alert fired at a strip that was switched
+off now switches it on, flashes, and switches it off again — and before the power
+goes it puts back exactly what the strip was showing: a colour, a brightness or a
+running effect. The device keeps that across a power cycle, so it is also what the
+light comes on as the next time you use it, rather than the alert's red.
+
 **v0.1.5** — arm64. The published image is now a multi-arch manifest for
 `linux/amd64` and `linux/arm64`, each half compiled on a runner of its own
 architecture rather than cross-built, so a Pi pulls the same tag and gets a binary
