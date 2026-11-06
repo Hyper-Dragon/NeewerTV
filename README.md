@@ -341,6 +341,7 @@ the compose file.
 | `AMBIENT_MAX_FPS` | `15` | Upper bound on samples per second, `0` for no bound. It bounds the work on a small box with an eager camera; the Bluetooth link cannot carry more than this anyway. |
 | `AMBIENT_SATURATION_GAIN` | `2.0` | How hard a sampled colour's saturation is pushed before it is sent. The firmware renders low saturation as white, so this is what stops a dim scene coming out colourless. |
 | `AMBIENT_LIGHTNESS_GAIN` | `1.4` | Scale applied to lightness above the firmware's dead zone — segments do not light at all below about L=20. Black stays black, because the gain only applies above a small floor. |
+| `AMBIENT_BLACK_LEVEL` | `10` | What the camera reports for a black screen. Without a locked exposure the camera raises gain in the dark until black reads as mid grey, and the strip then never dims. Set this to the value the swatches show while the screen is black. |
 | `LOG_LEVEL` | `info` | A `tracing` directive, so `info,neewertv::ble=debug` works. |
 | `LOG_FORMAT` | `text` | `text`, or `json` if you're shipping logs somewhere. |
 | `DBUS_SYSTEM_BUS_ADDRESS` | — | Set to `unix:path=/run/dbus/system_bus_socket` inside the container. The compose file does it for you. |

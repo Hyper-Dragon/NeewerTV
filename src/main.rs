@@ -313,6 +313,7 @@ async fn run() -> anyhow::Result<()> {
             command_tx.clone(),
             snapshot_rx.clone(),
             neewertv::ambient::render::Render {
+                black_level: config.ambient.black_level,
                 saturation_gain: config.ambient.saturation_gain,
                 lightness_gain: config.ambient.lightness_gain,
                 ..Default::default()

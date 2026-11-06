@@ -163,6 +163,8 @@ pub struct AmbientConfig {
     pub saturation_gain: f32,
     /// Multiplier on the lightness above the firmware's dead zone.
     pub lightness_gain: f32,
+    /// Channel value treated as black, 0–64.
+    pub black_level: u8,
 }
 
 /// Every environment variable the daemon reads.
@@ -190,6 +192,7 @@ pub mod env {
     pub const AMBIENT_MAX_FPS: &str = "AMBIENT_MAX_FPS";
     pub const AMBIENT_SATURATION_GAIN: &str = "AMBIENT_SATURATION_GAIN";
     pub const AMBIENT_LIGHTNESS_GAIN: &str = "AMBIENT_LIGHTNESS_GAIN";
+    pub const AMBIENT_BLACK_LEVEL: &str = "AMBIENT_BLACK_LEVEL";
     pub const WEB_INTERFACE: &str = "WEB_INTERFACE";
     pub const WEB_BIND: &str = "WEB_BIND";
     pub const LOG_LEVEL: &str = "LOG_LEVEL";
@@ -254,6 +257,12 @@ pub mod default {
     /// measures it, which is why they are settings rather than constants.
     pub const AMBIENT_SATURATION_GAIN: f32 = 2.0;
     pub const AMBIENT_LIGHTNESS_GAIN: f32 = 1.4;
+    /// What the camera reports for a black screen.
+    ///
+    /// Without a locked exposure the camera raises gain in the dark until black
+    /// reads as mid grey, and the strip then never dims. Set this to the value the
+    /// swatches show while the screen is black.
+    pub const AMBIENT_BLACK_LEVEL: u8 = 10;
 }
 
 /// Which alert colours to publish as buttons, and how long they last.
@@ -362,6 +371,8 @@ impl Config {
                 default::AMBIENT_LIGHTNESS_GAIN,
             )?
             .clamp(0.0, 8.0),
+            black_level: parse_or(&get, env::AMBIENT_BLACK_LEVEL, default::AMBIENT_BLACK_LEVEL)?
+                .min(MAX_AMBIENT_BLACK_LEVEL),
         };
 
         Ok(Self {
@@ -386,6 +397,10 @@ impl Config {
 /// The highest sample rate anybody can sensibly ask for: the camera will not go
 /// above sixty and neither should the setting.
 const MAX_AMBIENT_FPS: u8 = 60;
+
+/// Above this a "black level" is just a darkening knob, and the scene it is meant
+/// to fix is the only thing left in range.
+const MAX_AMBIENT_BLACK_LEVEL: u8 = 64;
 
 /// Turn `ALERT_BUTTONS` into colours, rejecting names that do not exist.
 ///
@@ -657,6 +672,7 @@ mod tests {
         assert_eq!(parsed.ambient.max_fps, 15);
         assert_eq!(parsed.ambient.saturation_gain, 2.0);
         assert_eq!(parsed.ambient.lightness_gain, 1.4);
+        assert_eq!(parsed.ambient.black_level, 10);
     }
 
     #[test]

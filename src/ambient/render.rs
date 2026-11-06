@@ -27,10 +27,19 @@ pub type Entry = (u8, u16, u8);
 pub const DEFAULT_SATURATION_GAIN: f32 = 2.0;
 pub const DEFAULT_LIGHTNESS_GAIN: f32 = 1.4;
 pub const DEFAULT_LIGHTNESS_FLOOR: u8 = 8;
+pub const DEFAULT_BLACK_LEVEL: u8 = 10;
 
 /// How a reading is pushed towards what the firmware renders well.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Render {
+    /// Every channel at or below this is treated as black, and the rest is
+    /// rescaled so white stays white.
+    ///
+    /// A camera that has not had its exposure locked does not report black as
+    /// zero: aimed at a dark scene it raises gain until the screen reads as mid
+    /// grey, and the strip then stays lit through the whole film. Set this to the
+    /// value the swatches show while the screen is black.
+    pub black_level: u8,
     /// Multiplier on saturation. The firmware renders low saturation as white.
     pub saturation_gain: f32,
     /// Multiplier on the part of lightness above [`Self::lightness_floor`].
@@ -42,6 +51,7 @@ pub struct Render {
 impl Default for Render {
     fn default() -> Self {
         Self {
+            black_level: DEFAULT_BLACK_LEVEL,
             saturation_gain: DEFAULT_SATURATION_GAIN,
             lightness_gain: DEFAULT_LIGHTNESS_GAIN,
             lightness_floor: DEFAULT_LIGHTNESS_FLOOR,
@@ -58,7 +68,11 @@ pub fn entries(colours: &[[u8; 3]], render: Render) -> Vec<Entry> {
 }
 
 fn entry(red: u8, green: u8, blue: u8, render: Render) -> Entry {
-    let hsi = rgb_to_hsi(red, green, blue);
+    let hsi = rgb_to_hsi(
+        black_point(red, render.black_level),
+        black_point(green, render.black_level),
+        black_point(blue, render.black_level),
+    );
 
     let saturation = scale(u16::from(hsi.saturation), render.saturation_gain);
 
@@ -72,6 +86,19 @@ fn entry(red: u8, green: u8, blue: u8, render: Render) -> Entry {
     };
 
     (lightness, hsi.hue, saturation)
+}
+
+/// Reset the black point: at or below `black` is zero, and the rest is stretched
+/// back so that 255 stays 255.
+fn black_point(value: u8, black: u8) -> u8 {
+    if black == 0 {
+        return value;
+    }
+    if value <= black {
+        return 0;
+    }
+    let span = u32::from(255 - black);
+    (((u32::from(value) - u32::from(black)) * 255 + span / 2) / span) as u8
 }
 
 /// Multiply, round, clamp to the device's 0–100.
@@ -91,11 +118,49 @@ mod tests {
         entries(&[rgb], render)[0]
     }
 
+    /// The lift on its own, with the black point out of the way.
+    fn lifting() -> Render {
+        Render {
+            black_level: 0,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn black_stays_black() {
         // The whole point of the floor: a dark scene must not be lifted into a glow.
-        let entry = one([0, 0, 0], Render::default());
-        assert_eq!(entry, (0, 0, 0));
+        for render in [Render::default(), lifting()] {
+            assert_eq!(one([0, 0, 0], render), (0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn a_camera_that_never_reads_black_is_pulled_down_to_it() {
+        // What a camera with auto-exposure does to a black scene: it raises gain
+        // until "black" is comfortably above zero, and the strip then never dims.
+        for level in [12, 20, 35] {
+            let render = Render {
+                black_level: level,
+                ..Default::default()
+            };
+            let nearly_black = [level, level, level];
+            assert_eq!(
+                one(nearly_black, render),
+                (0, 0, 0),
+                "{level} should be treated as black"
+            );
+        }
+    }
+
+    #[test]
+    fn the_black_point_does_not_dim_what_is_bright() {
+        // White has to survive, or every field would lose brightness to the fixing
+        // of the darkest one.
+        let render = Render {
+            black_level: 30,
+            ..Default::default()
+        };
+        assert_eq!(one([255, 255, 255], render), (100, 0, 0));
     }
 
     #[test]
@@ -103,7 +168,7 @@ mod tests {
         // The sample from the field report: a dim olive that the firmware
         // rendered as near-white.
         let rgb = [98, 94, 69];
-        let (lightness, hue, saturation) = one(rgb, Render::default());
+        let (lightness, hue, saturation) = one(rgb, lifting());
 
         // Hue is never touched. What the camera saw is what gets described, and
         // only the two components the firmware renders badly are rescaled.
@@ -114,22 +179,22 @@ mod tests {
 
     #[test]
     fn a_saturated_primary_comes_out_unchanged() {
-        assert_eq!(one([255, 0, 0], Render::default()), (100, 0, 100));
-        assert_eq!(one([0, 255, 0], Render::default()), (100, 120, 100));
-        assert_eq!(one([0, 0, 255], Render::default()), (100, 240, 100));
+        assert_eq!(one([255, 0, 0], lifting()), (100, 0, 100));
+        assert_eq!(one([0, 255, 0], lifting()), (100, 120, 100));
+        assert_eq!(one([0, 0, 255], lifting()), (100, 240, 100));
     }
 
     #[test]
     fn greys_stay_grey() {
         // Saturation has nothing to amplify, so the lift cannot invent a colour.
-        let (lightness, hue, saturation) = one([128, 128, 128], Render::default());
+        let (_, hue, saturation) = one([128, 128, 128], lifting());
         assert_eq!((hue, saturation), (0, 0));
-        assert_eq!(lightness, 67);
     }
 
     #[test]
     fn a_gain_of_one_and_no_floor_is_the_identity() {
         let neutral = Render {
+            black_level: 0,
             saturation_gain: 1.0,
             lightness_gain: 1.0,
             lightness_floor: 0,

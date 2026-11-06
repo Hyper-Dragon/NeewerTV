@@ -115,6 +115,10 @@ Tier 0 only: no calibration pass, just better arithmetic.
 `rgb_to_hsi` reports what the camera saw. The firmware does not render that well,
 so a reading is lifted on the way out (`src/ambient/render.rs`):
 
+- **The black point is reset first** — `AMBIENT_BLACK_LEVEL`, default 10. A camera
+  without a locked exposure raises gain in the dark until a black screen reads as
+  mid grey, and the strip then never dims; this is the software answer to that,
+  and locking the exposure (Tier 3) is the real one.
 - **Saturation is multiplied** — `AMBIENT_SATURATION_GAIN`, default 2. A dim,
   desaturated sample, which is what an averaged low-light frame produces, comes
   back from the firmware as near-white instead of as the colour it describes.
