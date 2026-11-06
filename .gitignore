@@ -35,3 +35,6 @@ rustc-ice-*.txt
 
 # Local build artefacts from the WSL toolchain.
 target-wsl/
+
+# local CI watchers and scratch scripts
+.scratch-*

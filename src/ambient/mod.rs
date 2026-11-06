@@ -47,6 +47,9 @@ pub const MEASURE_FRAMES: usize = 20;
 /// The channel a measurement request travels on.
 type MeasureReply = oneshot::Sender<anyhow::Result<Measurement>>;
 
+/// How long a measurement waits for one camera frame before giving up.
+const MEASURE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Addressable segments on the strip. Segments are equal length along the strip;
 /// the *zones* they are fed from are not, because the corners are squares.
 pub const SEGMENTS: usize = 20;
@@ -364,6 +367,21 @@ async fn sample_frames(
     let mut last_sampled: Option<Instant> = None;
 
     loop {
+        // Rebuild only when the calibration actually changed: a save swaps the
+        // `Arc`, so pointer equality is the test and no version counter is needed.
+        // Done before the select so that a measurement request never meets a
+        // sampler built from the calibration it is about to replace.
+        let current = calibration.read().ok().and_then(|slot| slot.clone());
+        let unchanged = match (&sampler_for, &current) {
+            (Some(previous), Some(next)) => Arc::ptr_eq(previous, next),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            sampler = current.as_ref().and_then(|next| Sampler::new(next));
+            sampler_for = current.clone();
+        }
+
         // The measurement arm has to borrow the frame channel too, so the select
         // only decides *what* happened and the work happens after it.
         let measured = tokio::select! {
@@ -393,19 +411,6 @@ async fn sample_frames(
                 continue;
             }
             last_sampled = Some(now);
-        }
-
-        // Rebuild only when the calibration actually changed: a save swaps the
-        // `Arc`, so pointer equality is the test and no version counter is needed.
-        let current = calibration.read().ok().and_then(|slot| slot.clone());
-        let unchanged = match (&sampler_for, &current) {
-            (Some(previous), Some(next)) => Arc::ptr_eq(previous, next),
-            (None, None) => true,
-            _ => false,
-        };
-        if !unchanged {
-            sampler = current.as_ref().and_then(|next| Sampler::new(next));
-            sampler_for = current.clone();
         }
 
         let fps = window.tick();
@@ -445,8 +450,12 @@ async fn measure_over(
     let mut seen = 0_usize;
 
     while seen < count {
-        if frames.changed().await.is_err() {
-            anyhow::bail!("the camera stopped while the field was being measured");
+        // A camera that has stopped publishing must not leave the request hanging
+        // forever: the operator would see a button that never answers.
+        match tokio::time::timeout(MEASURE_TIMEOUT, frames.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => anyhow::bail!("the camera stopped while the field was being measured"),
+            Err(_) => anyhow::bail!("the camera is not publishing frames"),
         }
 
         let frame = {
