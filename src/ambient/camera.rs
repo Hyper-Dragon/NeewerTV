@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use super::controls::{CameraRequest, CameraSetting};
 use super::sampling::Frame;
 
 /// The four character codes we know how to unpack.
@@ -175,12 +176,14 @@ pub fn bmp(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
 pub fn spawn(
     path: PathBuf,
     frames: watch::Sender<Option<Arc<Frame>>>,
+    controls: std::sync::mpsc::Receiver<CameraRequest>,
+    settings: Vec<CameraSetting>,
     shutdown: CancellationToken,
 ) {
     let name = "ambient-capture".to_owned();
     let spawned = std::thread::Builder::new().name(name).spawn(move || {
         while !shutdown.is_cancelled() {
-            match capture(&path, &frames, &shutdown) {
+            match capture(&path, &frames, &controls, &settings, &shutdown) {
                 // Only a cancelled shutdown returns `Ok`.
                 Ok(()) => return,
                 Err(err) => warn!(
@@ -209,6 +212,8 @@ pub fn spawn(
 pub fn spawn(
     path: PathBuf,
     _frames: watch::Sender<Option<Arc<Frame>>>,
+    _controls: std::sync::mpsc::Receiver<CameraRequest>,
+    _settings: Vec<CameraSetting>,
     _shutdown: CancellationToken,
 ) {
     warn!(
@@ -221,6 +226,8 @@ pub fn spawn(
 fn capture(
     path: &std::path::Path,
     frames: &watch::Sender<Option<Arc<Frame>>>,
+    controls: &std::sync::mpsc::Receiver<CameraRequest>,
+    settings: &[CameraSetting],
     shutdown: &CancellationToken,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
@@ -233,6 +240,10 @@ fn capture(
 
     let device = Device::with_path(path)
         .map_err(|err| anyhow::anyhow!("opening {}: {err}", path.display()))?;
+
+    // Before the stream starts, so the first frame is already taken at the
+    // settings the flat field was measured with.
+    apply_settings(&device, settings);
 
     let (format, coding) = choose_format(&device)?;
     tracing::info!(
@@ -249,6 +260,26 @@ fn capture(
     loop {
         if shutdown.is_cancelled() {
             return Ok(());
+        }
+
+        // Requests are served between frames rather than from another thread: the
+        // node cannot be queried twice while it is streaming, and a control change
+        // is a few microseconds against a 66 ms frame.
+        while let Ok(request) = controls.try_recv() {
+            match request {
+                CameraRequest::List(reply) => {
+                    let _ = reply.send(list_controls(&device));
+                }
+                CameraRequest::Set { id, value, reply } => {
+                    let _ = reply.send(set_control(&device, id, value));
+                }
+                CameraRequest::Quiet { id, value } => {
+                    let _ = set_control(&device, id, value);
+                }
+                CameraRequest::Apply(settings) => {
+                    apply_settings(&device, &settings);
+                }
+            }
         }
 
         let (buffer, meta) = stream.next().context("waiting for a frame")?;
@@ -308,6 +339,119 @@ fn choose_format(device: &v4l::device::Device) -> anyhow::Result<(v4l::format::F
         super::CAPTURE_WIDTH,
         super::CAPTURE_HEIGHT
     )
+}
+
+/// Every control the camera offers, with its current value.
+///
+/// Compound and button controls are skipped: they have no single number to show,
+/// and the ones that matter here — gain, exposure, white balance — are all plain
+/// integers or menus.
+#[cfg(target_os = "linux")]
+pub fn list_controls(device: &v4l::device::Device) -> Vec<super::CameraControl> {
+    use v4l::control::{Flags, MenuItem, Type, Value};
+
+    let Ok(descriptions) = device.query_controls() else {
+        return Vec::new();
+    };
+
+    let mut controls: Vec<super::CameraControl> = descriptions
+        .into_iter()
+        .filter_map(|description| {
+            let kind = match description.typ {
+                Type::Integer | Type::Integer64 | Type::IntegerMenu => "integer",
+                Type::Boolean => "boolean",
+                Type::Menu => "menu",
+                _ => return None,
+            };
+
+            let value = match device.control(description.id) {
+                Ok(control) => match control.value {
+                    Value::Integer(number) => number,
+                    Value::Boolean(flag) => i64::from(u8::from(flag)),
+                    _ => description.default,
+                },
+                Err(_) => description.default,
+            };
+
+            let items = description
+                .items
+                .as_ref()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|(index, item)| match item {
+                            MenuItem::Name(name) => Some((*index, name.clone())),
+                            MenuItem::Value(_) => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            Some(super::CameraControl {
+                id: description.id,
+                name: description.name,
+                kind: kind.to_owned(),
+                minimum: description.minimum,
+                maximum: description.maximum,
+                step: description.step as i64,
+                default: description.default,
+                value,
+                inactive: description.flags.contains(Flags::INACTIVE),
+                read_only: description.flags.contains(Flags::READ_ONLY),
+                items,
+            })
+        })
+        .collect();
+
+    controls.sort_by(|a, b| a.name.cmp(&b.name));
+    controls
+}
+
+/// Pin one of the camera's controls.
+#[cfg(target_os = "linux")]
+pub fn set_control(device: &v4l::device::Device, id: u32, value: i64) -> anyhow::Result<()> {
+    use v4l::control::{Control, Value};
+    use v4l::video::Capture as _;
+
+    device
+        .set_control(Control {
+            id,
+            value: Value::Integer(value),
+        })
+        .map_err(|err| anyhow::anyhow!("setting control {id} to {value}: {err}"))
+}
+
+/// Apply a stored set of settings, in an order that does not have to be right.
+///
+/// One control can be gated by another: `exposure_absolute` is inactive until
+/// `exposure_auto` is off, and the file lists settings in the order they were
+/// first touched rather than in dependency order. A second pass costs
+/// microseconds and resolves any such ordering.
+#[cfg(target_os = "linux")]
+fn apply_settings(device: &v4l::device::Device, settings: &[super::CameraSetting]) {
+    let mut failures = Vec::new();
+    for pass in 0..2 {
+        failures = settings
+            .iter()
+            .filter_map(|setting| {
+                set_control(device, setting.id, setting.value)
+                    .err()
+                    .map(|err| (*setting, err.to_string()))
+            })
+            .collect();
+        if failures.is_empty() || pass == 1 {
+            break;
+        }
+    }
+
+    for (setting, err) in failures {
+        warn!(
+            id = setting.id,
+            value = setting.value,
+            %err,
+            "a stored camera setting was refused; the flat field may not match"
+        );
+    }
 }
 
 /// Turn one block of camera bytes into a frame the rest of the daemon can use.

@@ -385,6 +385,16 @@ environment: they are judgements about this screen and this strip, made while
 looking at both, and they move with the calibration rather than with the compose
 file. Re-saving the corners never discards them.
 
+The page also lists **the camera's own controls** — gain, exposure, white balance,
+power-line frequency. Pin gain and exposure there instead of turning the television
+down: a camera that re-exposes between the white field and the black field is two
+different instruments, and the flat field it produces corrects the wrong thing.
+Those values are stored with the calibration and applied when the camera opens.
+
+While the page is open the status line reports both rates — frames sampled and
+writes delivered to the strip. They are not the same number, and the second one is
+the one you can see.
+
 **While the calibration page is open, the strip follows the camera** — twenty
 segments, at the brightness the light is already set to. Leaving the page puts the
 strip back exactly as it was, including switching it off again if it was off. That

@@ -73,6 +73,13 @@ pub struct Calibration {
     /// both of which show up as a strip that is brighter in the middle.
     #[serde(default)]
     pub white: Option<[[f32; 3]; SEGMENTS]>,
+    /// Camera controls pinned to the values they were measured at.
+    ///
+    /// A camera left to itself hunts, and a flat field measured while it hunts is
+    /// a measurement of two different cameras. These are applied when the device
+    /// opens, so a restart comes back to the same instrument.
+    #[serde(default)]
+    pub camera: Vec<super::CameraSetting>,
 }
 
 fn default_aspect() -> f32 {
@@ -245,6 +252,7 @@ mod tests {
             render: Render::default(),
             black: None,
             white: None,
+            camera: Vec::new(),
         }
     }
 
@@ -272,6 +280,10 @@ mod tests {
         assert_eq!(loaded.version, CALIBRATION_VERSION, "upgraded on read");
         assert_eq!(loaded.render, Render::default(), "tuning filled in");
         assert_eq!(loaded.corners, sample().corners, "corners survive");
+        assert!(
+            loaded.camera.is_empty(),
+            "an old file pinned no camera settings, so it inherits none"
+        );
 
         std::fs::remove_dir_all(&directory).ok();
     }

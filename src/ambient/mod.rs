@@ -14,6 +14,7 @@
 
 pub mod calibration;
 pub mod camera;
+pub mod controls;
 pub mod geometry;
 pub mod render;
 pub mod sampling;
@@ -28,15 +29,18 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 pub use calibration::{Calibration, FrameSize};
+pub use controls::{CameraControl, CameraSetting};
 pub use geometry::{Homography, Rect, zone_rects};
 pub use render::Render;
 pub use sampling::{Correction, Frame, Measurement, Reading, Rgb, Sampler};
 
 /// Format of the calibration file. Bumped when the meaning of a field changes.
 ///
-/// Version 1 had no flat field and no render tuning; both are supplied by serde
-/// defaults when an old file is read, and it is rewritten as version 2.
-pub const CALIBRATION_VERSION: u32 = 2;
+/// Version 1 had no flat field and no render tuning. Version 2 added them, along
+/// with the camera settings that pin the things the flat field is measured at.
+/// Every one is supplied by a serde default when an older file is read, so an
+/// old calibration keeps its corners and is rewritten at the current version.
+pub const CALIBRATION_VERSION: u32 = 3;
 
 /// How many frames a flat-field measurement averages over.
 ///
@@ -167,6 +171,7 @@ pub struct Handle {
     path: PathBuf,
     viewing: Arc<Viewing>,
     measure: mpsc::Sender<MeasureReply>,
+    camera: Option<std::sync::mpsc::Sender<controls::CameraRequest>>,
 }
 
 impl Handle {
@@ -234,10 +239,46 @@ impl Handle {
     /// to tell that from the mode having been broken.
     pub fn save(&self, calibration: Calibration) -> anyhow::Result<()> {
         calibration.save(&self.path)?;
+        // A saved calibration is also a statement about how the camera is set, so
+        // the device is brought into line with it. Otherwise the file and the
+        // instrument drift apart and the next flat field is measured through
+        // settings nobody chose.
+        if let Some(camera) = self.camera.as_ref() {
+            let _ = camera.send(controls::CameraRequest::Apply(calibration.camera.clone()));
+        }
         if let Ok(mut slot) = self.calibration.write() {
             *slot = Some(Arc::new(calibration));
         }
         Ok(())
+    }
+
+    /// Every control the camera offers, with its current value.
+    pub async fn camera_controls(&self) -> anyhow::Result<Vec<CameraControl>> {
+        let Some(camera) = self.camera.as_ref() else {
+            anyhow::bail!("this build has no camera to configure")
+        };
+        let (reply, answer) = oneshot::channel();
+        camera
+            .send(controls::CameraRequest::List(reply))
+            .map_err(|_| anyhow::anyhow!("the camera is not running"))?;
+        answer
+            .await
+            .map_err(|_| anyhow::anyhow!("the camera dropped the request"))
+    }
+
+    /// Pin one of the camera's controls, so a measurement is repeatable.
+    pub async fn set_camera_control(&self, id: u32, value: i64) -> anyhow::Result<()> {
+        let Some(camera) = self.camera.as_ref() else {
+            anyhow::bail!("this build has no camera to configure")
+        };
+        let (reply, answer) = oneshot::channel();
+        camera
+            .send(controls::CameraRequest::Set { id, value, reply })
+            .map_err(|_| anyhow::anyhow!("the camera is not running"))?;
+        answer
+            .await
+            .map_err(|_| anyhow::anyhow!("the camera dropped the request"))?
+            .map_err(|err| anyhow::anyhow!(err))
     }
 }
 
@@ -316,9 +357,18 @@ pub fn start(
     let (latest_tx, latest_rx) = watch::channel(None);
     let (change, _) = watch::channel(false);
     let (measure_tx, measure_rx) = mpsc::channel(1);
-    let calibration = Arc::new(RwLock::new(stored));
 
-    camera::spawn(device, frames_tx, shutdown.clone());
+    // The camera thread owns the device, so its settings travel to it rather than
+    // being applied from here. Unbounded on the sending side: a request is a few
+    // bytes and must never fail because the thread is mid-frame.
+    let settings = stored
+        .as_ref()
+        .map(|calibration| calibration.camera.clone())
+        .unwrap_or_default();
+    let (camera_tx, camera_rx) = std::sync::mpsc::channel();
+    camera::spawn(device, frames_tx, camera_rx, settings, shutdown.clone());
+
+    let calibration = Arc::new(RwLock::new(stored));
 
     tokio::spawn(sample_frames(
         frames_rx.clone(),
@@ -339,6 +389,7 @@ pub fn start(
             change,
         }),
         measure: measure_tx,
+        camera: Some(camera_tx),
     }
 }
 

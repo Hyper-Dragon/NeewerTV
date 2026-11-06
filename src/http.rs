@@ -46,6 +46,8 @@ pub const PATH_AMBIENT: &str = "/api/ambient";
 pub const PATH_CALIBRATION: &str = "/api/calibration";
 /// Measure the white or black field that is on screen right now.
 pub const PATH_CALIBRATION_FIELD: &str = "/api/calibration/field";
+/// The camera's own controls: gain, exposure, white balance.
+pub const PATH_CAMERA: &str = "/api/camera";
 
 /// Boundary between the parts of the preview stream.
 const PREVIEW_BOUNDARY: &str = "neewertv-frame";
@@ -124,7 +126,8 @@ pub fn router(state: AppState) -> Router {
                 PATH_CALIBRATION,
                 get(api_calibration).post(api_calibration_save),
             )
-            .route(PATH_CALIBRATION_FIELD, post(api_calibration_field));
+            .route(PATH_CALIBRATION_FIELD, post(api_calibration_field))
+            .route(PATH_CAMERA, get(api_camera).post(api_camera_set));
     }
 
     router.with_state(state)
@@ -160,10 +163,16 @@ button.primary{background:#14161a;color:#fff;border-color:#14161a}
 .swatch.small{width:auto;height:2.4rem;border-radius:8px;font-size:.68rem;display:flex;align-items:flex-end;justify-content:center;color:#fff;text-shadow:0 0 3px #000}
 .swatch[data-clipped=1]{outline:2px solid #ef4444;outline-offset:1px}
 .hint{color:#6b7280;font-size:.85rem;margin:.9rem 0 0}
+.controls{display:grid;gap:.35rem}
+.ctrl{display:grid;grid-template-columns:minmax(8rem,13rem) 1fr auto;gap:.6rem;align-items:center;font-size:.85rem;color:#4b5563}
+.ctrl em{font-style:normal;font-size:.72rem;color:#9aa3af}
+.ctrl input[type=range]{width:100%}
+.ctrl select{font:inherit;padding:.2rem .4rem;border-radius:8px;border:1px solid #d7dbe0;background:#fff;color:inherit}
 @media (prefers-color-scheme:dark){
-.row label,.hint{color:#9aa3af}
+.row label,.hint,.ctrl{color:#9aa3af}
 button{background:#1b1f25;color:#e7e9ee;border-color:#2b313a}
 button.primary{background:#e7e9ee;color:#101215;border-color:#e7e9ee}
+.ctrl select{background:#1b1f25;color:#e7e9ee;border-color:#2b313a}
 }
 </style>";
 
@@ -211,6 +220,16 @@ colour, so whatever differs between them is the camera &mdash; lens shading, ang
 distance, the light in the room. Do the same with the black field to find the floor the
 camera reports with nothing on screen. Either one can be measured on its own, and both
 are saved into the calibration.</p>
+</section>
+<section class="card"><h2>Camera</h2>
+<div id="camera" class="controls"><span class="hint">reading the camera&hellip;</span></div>
+<p class="hint">Pin the camera's own gain and exposure here rather than turning the
+television down. Left alone a camera re-exposes whenever the picture changes, so a white
+field captured at one setting and a black field at another describe two different
+cameras. Turn <em>Auto Exposure</em> off before setting <em>Exposure, Absolute</em>, and
+set <em>Power Line Frequency</em> to the rate your lighting runs at or the sampling can
+pick up banding. Everything here is stored with the calibration and applied when the
+device opens.</p>
 </section>
 <section class="card"><h2>Segment colours</h2><div id="swatches" class="swatches"></div></section>
 </main>
@@ -450,6 +469,96 @@ function updateFields(white, black) {
   document.getElementById('fields').textContent = 'flat field: ' + marks.join(' \u00b7 ');
 }
 
+const cameraBox = document.getElementById('camera');
+
+// The camera's own controls. A range input for integers, a select for menus and a
+// checkbox for booleans: enough to pin gain and exposure, which is the point.
+function renderControls(controls) {
+  cameraBox.replaceChildren();
+  if (!controls || !controls.length) {
+    cameraBox.textContent = 'this camera reports no controls';
+    return;
+  }
+
+  controls.forEach((control) => {
+    const row = document.createElement('label');
+    row.className = 'ctrl';
+
+    const name = document.createElement('span');
+    name.textContent = control.name;
+    row.append(name);
+
+    if (control.kind === 'menu' && control.items.length) {
+      const select = document.createElement('select');
+      select.disabled = control.read_only;
+      control.items.forEach(([value, label]) => {
+        const option = document.createElement('option');
+        option.value = String(value);
+        option.textContent = label;
+        option.selected = value === control.value;
+        select.append(option);
+      });
+      select.addEventListener('change', () => setControl(control.id, Number(select.value)));
+      row.append(select, document.createElement('em'));
+    } else if (control.kind === 'boolean') {
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = control.value !== 0;
+      box.disabled = control.read_only;
+      box.addEventListener('change', () => setControl(control.id, box.checked ? 1 : 0));
+      row.append(box, document.createElement('em'));
+    } else {
+      const slider = document.createElement('input');
+      slider.type = 'range';
+      slider.min = String(control.minimum);
+      slider.max = String(control.maximum);
+      slider.step = String(control.step || 1);
+      slider.value = String(control.value);
+      slider.disabled = control.read_only;
+      const readout = document.createElement('em');
+      readout.textContent = String(control.value);
+      // Live while dragging, written on release: a slider drag is one setting,
+      // not two hundred.
+      slider.addEventListener('input', () => { readout.textContent = slider.value; });
+      slider.addEventListener('change', () => setControl(control.id, Number(slider.value)));
+      row.append(slider, readout);
+    }
+
+    if (control.inactive) {
+      const note = row.lastElementChild;
+      note.textContent = 'inactive';
+      note.title = 'the driver will not accept this until the control it depends on changes';
+    }
+    cameraBox.append(row);
+  });
+}
+
+async function setControl(id, value) {
+  const res = await fetch('/api/camera', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id, value }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    statusLine.textContent = 'camera refused that: ' + (body.error || res.status);
+    return;
+  }
+  statusLine.textContent = 'camera setting stored with the calibration';
+  if (body.controls) renderControls(body.controls);
+}
+
+async function loadCamera() {
+  try {
+    const res = await fetch('/api/camera');
+    if (!res.ok) return;
+    const body = await res.json();
+    renderControls(body.controls);
+  } catch (err) {
+    // No camera, no card. The rest of the page still works.
+  }
+}
+
 async function measureField(field) {
   statusLine.textContent = 'measuring the ' + field + ' field\u2026';
   const res = await fetch('/api/calibration/field', {
@@ -556,7 +665,7 @@ async function loadSaved() {
   }
 }
 
-loadSaved().then(refresh);
+loadSaved().then(loadCamera).then(refresh);
 </script>
 "#;
 
@@ -786,6 +895,78 @@ struct FieldRequest {
     field: String,
 }
 
+/// One camera control, set from the page.
+#[derive(Debug, Deserialize)]
+struct CameraSetRequest {
+    id: u32,
+    value: i64,
+}
+
+/// Everything the camera can be told, with what it is currently told.
+async fn api_camera(State(state): State<AppState>) -> Response {
+    let Some(ambient) = state.ambient.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match ambient.camera_controls().await {
+        Ok(controls) => Json(json!({ "controls": controls })).into_response(),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Pin one camera control, and remember it.
+///
+/// The value goes to the device first and only then into the calibration file: a
+/// setting that the driver refused is not one the next start should try to apply.
+async fn api_camera_set(
+    State(state): State<AppState>,
+    Json(request): Json<CameraSetRequest>,
+) -> Response {
+    let Some(ambient) = state.ambient.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    if let Err(err) = ambient.set_camera_control(request.id, request.value).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    if let Some(stored) = ambient.calibration() {
+        let mut calibration = (*stored).clone();
+        match calibration
+            .camera
+            .iter_mut()
+            .find(|setting| setting.id == request.id)
+        {
+            Some(setting) => setting.value = request.value,
+            None => calibration.camera.push(ambient::CameraSetting {
+                id: request.id,
+                value: request.value,
+            }),
+        }
+        if let Err(err) = ambient.save(calibration) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
+    // Answer with the whole list again: setting one control can activate or
+    // deactivate another, and the page should not have to guess which.
+    match ambient.camera_controls().await {
+        Ok(controls) => Json(json!({ "ok": true, "controls": controls })).into_response(),
+        Err(err) => Json(json!({ "ok": true, "error": err.to_string() })).into_response(),
+    }
+}
+
 /// Persist a calibration and put it to work immediately.
 async fn api_calibration_save(
     State(state): State<AppState>,
@@ -843,6 +1024,10 @@ async fn api_calibration_save(
             .unwrap_or_default(),
         black: stored.as_ref().and_then(|saved| saved.black),
         white: stored.as_ref().and_then(|saved| saved.white),
+        camera: stored
+            .as_ref()
+            .map(|saved| saved.camera.clone())
+            .unwrap_or_default(),
     };
 
     match ambient.save(calibration) {

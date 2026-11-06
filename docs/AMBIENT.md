@@ -50,6 +50,14 @@ V4L2 (MJPEG or YUYV) → pixels ─┬→ Sampler ─┬→ /api/ambient  (colou
 - **One write per frame, no queue.** A `watch` channel carries the newest frame
   and the newest reading. If sampling ever fell behind, skipping frames is the
   correct behaviour.
+- **The link, not the camera, is the limit.** The camera samples at fifteen frames
+  a second; one frame is a single 93-byte write, and that write is the whole
+  update rate. Two things follow. Every frame is written as an ATT Write Command
+  when the strip's characteristic offers one, because an acknowledged write costs
+  a round trip and a handful of round trips a second is not a preview. And the
+  frame queue drains to the newest frame rather than replaying a backlog: a colour
+  the screen has already left behind is not worth sending. The calibration page
+  shows both rates — sampled and delivered — so the difference is visible.
 - **No geometry in the browser.** `/api/ambient` returns each zone's four corners
   already projected into the frame, so the overlay is drawn from the numbers the
   sampler used. One implementation, in Rust, that cannot drift.
@@ -140,6 +148,33 @@ as the average of `a` scaled.
 
 Gains are clamped to 0.25–4.0. A zone that measured almost nothing would otherwise
 get an enormous multiplier and turn sensor noise into a light show.
+
+## The camera's own settings
+
+A flat field is only a measurement if the instrument did not move between the two
+halves. Left alone, a camera does exactly that: aimed at a dark film it raises its
+own gain until black reads as mid grey, aimed at a bright one it winds down until
+the white field is a grey field. Measuring the white field means making the camera
+stop clipping; measuring the black field means making it stop compensating. If it
+compensates differently for each, the two halves describe two different cameras and
+the correction is pointless.
+
+The answer is not to turn the television down to five percent. The calibration page
+lists the camera's own V4L2 controls — gain, exposure, white balance, power-line
+frequency, backlight compensation — and lets them be pinned. Whatever is pinned is
+stored with the calibration and applied when the device opens, so a restart comes
+back to the same instrument rather than to whatever the camera decided today.
+
+Two of them are worth knowing about:
+
+- **Auto Exposure must be off before Exposure, Absolute can be set.** The driver
+  reports the absolute control as `inactive` while auto is on, and refuses it.
+  Settings are applied twice at open for this reason: one control can gate
+  another, and the file lists them in the order they were first touched rather
+  than in dependency order.
+- **Power Line Frequency** should match the mains. Left on the wrong value the
+  camera integrates over a fraction of a lighting cycle and the sampling picks up
+  a beat that looks like the strip pulsing.
 
 ## What the strip is actually sent
 
