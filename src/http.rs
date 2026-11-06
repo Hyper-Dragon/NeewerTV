@@ -14,13 +14,17 @@
 
 use std::time::Instant;
 
+use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::response::Html;
+use axum::http::{StatusCode, header};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
+use crate::ambient;
 use crate::ble::worker::Snapshot;
 use crate::config::WebMode;
 use crate::logs::LogBuffer;
@@ -31,6 +35,17 @@ pub const PATH_HEALTH: &str = "/healthz";
 pub const PATH_STATE: &str = "/api/state";
 pub const PATH_LOGS: &str = "/api/logs";
 pub const PATH_ROOT: &str = "/";
+/// The ambient calibration surface. Served only in `WEB_INTERFACE=ambient`.
+pub const PATH_CALIBRATE: &str = "/calibrate";
+/// The camera as an MJPEG stream, consumed by a plain `<img>`.
+pub const PATH_PREVIEW: &str = "/preview";
+/// The latest twenty zone colours and their outlines.
+pub const PATH_AMBIENT: &str = "/api/ambient";
+/// The stored calibration, read and written.
+pub const PATH_CALIBRATION: &str = "/api/calibration";
+
+/// Boundary between the parts of the preview stream.
+const PREVIEW_BOUNDARY: &str = "neewertv-frame";
 
 /// Where the source lives.
 ///
@@ -78,20 +93,353 @@ pub struct AppState {
     /// so the address belongs on the page before anyone has to guess.
     pub configured_address: Option<String>,
     pub version: String,
+    /// Present only while ambient capture is running, which is what decides
+    /// whether the calibration routes exist at all.
+    pub ambient: Option<ambient::Handle>,
 }
 
 /// Build the router.
 ///
-/// Nothing here can change the strip, so there is no mode-dependent routing left
-/// to get wrong.
+/// The calibration routes are registered only when they can work. A route that
+/// does not exist cannot be reached by a mistake in an authorisation check, and
+/// that is the same reasoning that keeps the status page read-only.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let calibration = state.ambient.is_some() && state.mode.permits_calibration();
+
+    let mut router = Router::new()
         .route(PATH_HEALTH, get(healthz))
         .route(PATH_STATE, get(api_state))
         .route(PATH_LOGS, get(api_logs))
-        .route(PATH_ROOT, get(index))
-        .with_state(state)
+        .route(PATH_ROOT, get(index));
+
+    if calibration {
+        router = router
+            .route(PATH_CALIBRATE, get(calibrate))
+            .route(PATH_PREVIEW, get(preview))
+            .route(PATH_AMBIENT, get(api_ambient))
+            .route(
+                PATH_CALIBRATION,
+                get(api_calibration).post(api_calibration_save),
+            );
+    }
+
+    router.with_state(state)
 }
+
+/// The tab row shown on the status page when the calibration screen exists.
+const TABS_MONITOR: &str = concat!(
+    "<nav class=\"tabs\">",
+    "<a class=\"on\" href=\"/\">Monitor</a>",
+    "<a href=\"/calibrate\">Calibrate</a>",
+    "</nav>"
+);
+
+/// The camera page's own copy of the row, with the selection reversed.
+const TABS_CALIBRATE: &str = concat!(
+    "<nav class=\"tabs\">",
+    "<a href=\"/\">Monitor</a>",
+    "<a class=\"on\" href=\"/calibrate\">Calibrate</a>",
+    "</nav>"
+);
+
+/// Extra styling for the calibration page only. The camera needs a real surface,
+/// not a 3 rem swatch, so none of this belongs on the status page.
+const CALIBRATION_STYLE: &str = r"<style>
+.cam{position:relative;border-radius:12px;overflow:hidden;background:#000;line-height:0}
+.cam img{width:100%;display:block}
+.cam canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
+.row{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}
+.row label{display:flex;gap:.4rem;align-items:center;font-size:.9rem;color:#4b5563}
+button{font:inherit;padding:.42rem .9rem;border-radius:10px;border:1px solid #d7dbe0;background:#fff;cursor:pointer}
+button.primary{background:#14161a;color:#fff;border-color:#14161a}
+.swatches{display:grid;grid-template-columns:repeat(10,minmax(0,1fr));gap:.4rem}
+.swatch.small{width:auto;height:2.4rem;border-radius:8px;font-size:.68rem;display:flex;align-items:flex-end;justify-content:center;color:#fff;text-shadow:0 0 3px #000}
+.swatch[data-clipped=1]{outline:2px solid #ef4444;outline-offset:1px}
+.hint{color:#6b7280;font-size:.85rem;margin:.9rem 0 0}
+@media (prefers-color-scheme:dark){
+.row label,.hint{color:#9aa3af}
+button{background:#1b1f25;color:#e7e9ee;border-color:#2b313a}
+button.primary{background:#e7e9ee;color:#101215;border-color:#e7e9ee}
+}
+</style>";
+
+/// The page above the tab row.
+const CALIBRATION_TOP: &str = r#"<main>
+<header><div class="ident"><h1>Ambient calibration</h1>
+<p class="meta">camera &rarr; twenty zone colours</p></div></header>
+"#;
+
+/// Everything below the tab row: the camera, the controls, and the overlay.
+const CALIBRATION_BOTTOM: &str = r#"
+<style>input[type=number]{font:inherit;padding:.3rem .5rem;border-radius:8px;border:1px solid #d7dbe0}
+input[type=range]{width:8rem}
+@media (prefers-color-scheme:dark){input[type=number]{background:#1b1f25;color:#e7e9ee;border-color:#2b313a}}</style>
+<section class="card"><h2>Camera</h2>
+<div class="cam"><img id="preview" src="/preview" alt="camera preview">
+<canvas id="view" width="640" height="480"></canvas></div>
+<p class="sub" id="status">starting&hellip;</p>
+</section>
+<section class="card"><h2>Parameters</h2>
+<div class="row">
+<label>Aspect <input id="aspect" type="number" step="0.01" min="0.5" max="4" value="1.7778" style="width:6rem"></label>
+<label>Depth <input id="depth" type="range" min="3" max="30" value="10"><span id="depthv">10%</span></label>
+<label><input id="linear" type="checkbox" checked> Linear light</label>
+<button id="save" class="primary">Save calibration</button>
+<button id="png">Save PNG</button>
+</div>
+<p class="hint">Click the four corners of the screen in order: top-left, top-right,
+bottom-right, bottom-left. Drag a handle to adjust it; right-click removes the last
+corner. The colours below are what the twenty segments will be sent &mdash; nothing is
+sent yet.</p>
+</section>
+<section class="card"><h2>Segment colours</h2><div id="swatches" class="swatches"></div></section>
+</main>
+<script>
+const view = document.getElementById('view');
+const ctx = view.getContext('2d');
+const img = document.getElementById('preview');
+const statusLine = document.getElementById('status');
+const swatchBox = document.getElementById('swatches');
+const labels = ['TL', 'TR', 'BR', 'BL'];
+
+let corners = [];
+let latest = null;
+let drag = -1;
+let aspect = 1.7778;
+let depth = 0.10;
+let linear = true;
+
+const pointAt = (event) => {
+  const box = view.getBoundingClientRect();
+  return {
+    x: (event.clientX - box.left) / box.width,
+    y: (event.clientY - box.top) / box.height,
+  };
+};
+
+function label(text, x, y) {
+  ctx.font = '600 ' + Math.max(11, view.height / 42) + 'px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = '#fff';
+  ctx.fillText(text, x, y);
+}
+
+function draw() {
+  ctx.clearRect(0, 0, view.width, view.height);
+
+  if (latest && latest.zones) {
+    latest.zones.forEach((zone, index) => {
+      ctx.beginPath();
+      zone.outline.forEach(([u, v], position) => {
+        const x = u * view.width, y = v * view.height;
+        if (position === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+      const c = zone.colour;
+      ctx.fillStyle = 'rgba(' + c.r + ',' + c.g + ',' + c.b + ',0.55)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      let cx = 0, cy = 0;
+      zone.outline.forEach(([u, v]) => { cx += u; cy += v; });
+      label(String(index + 1),
+        (cx / zone.outline.length) * view.width,
+        (cy / zone.outline.length) * view.height);
+    });
+  }
+
+  if (corners.length >= 2) {
+    ctx.beginPath();
+    corners.forEach((corner, position) => {
+      const x = corner.x * view.width, y = corner.y * view.height;
+      if (position === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    if (corners.length === 4) ctx.closePath();
+    ctx.strokeStyle = 'rgba(90,220,140,0.95)';
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+  }
+
+  corners.forEach((corner, index) => {
+    const x = corner.x * view.width, y = corner.y * view.height;
+    const radius = Math.max(9, view.height / 55);
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(90,220,140,0.25)';
+    ctx.fill();
+    ctx.strokeStyle = '#5adc8c';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    label(labels[index] || '', x, y - radius - radius * 0.85);
+  });
+
+  if (corners.length < 4) {
+    ctx.font = '600 ' + Math.max(13, view.height / 32) + 'px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+    ctx.strokeText('click ' + labels[corners.length], view.width / 2, view.height * 0.06);
+    ctx.fillStyle = '#5adc8c';
+    ctx.fillText('click ' + labels[corners.length], view.width / 2, view.height * 0.06);
+  }
+}
+
+function renderSwatches() {
+  if (!latest || !latest.zones) return;
+  if (swatchBox.children.length !== latest.zones.length) {
+    swatchBox.replaceChildren();
+    latest.zones.forEach((_, index) => {
+      const cell = document.createElement('div');
+      cell.className = 'swatch small';
+      const number = document.createElement('span');
+      number.textContent = String(index + 1);
+      cell.append(number);
+      swatchBox.append(cell);
+    });
+  }
+  latest.zones.forEach((zone, index) => {
+    const cell = swatchBox.children[index];
+    const c = zone.colour;
+    cell.style.background = 'rgb(' + c.r + ',' + c.g + ',' + c.b + ')';
+    cell.dataset.clipped = zone.clipped ? '1' : '0';
+  });
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/ambient');
+    if (res.ok) {
+      latest = await res.json();
+      if (view.width !== latest.frame.width || view.height !== latest.frame.height) {
+        view.width = latest.frame.width;
+        view.height = latest.frame.height;
+      }
+      const bits = [latest.fps.toFixed(1) + ' fps'];
+      bits.push(latest.calibrated ? 'sampling' : 'not calibrated');
+      if (latest.clipped_zones > 0) bits.push(latest.clipped_zones + ' over-exposed');
+      statusLine.textContent = bits.join(' \u00b7 ');
+    } else if (res.status === 503) {
+      statusLine.textContent = 'waiting for the camera';
+    }
+  } catch (err) {
+    statusLine.textContent = 'cannot reach the daemon: ' + err;
+  }
+  draw();
+  renderSwatches();
+  setTimeout(refresh, 120);
+}
+
+async function saveCalibration() {
+  if (corners.length !== 4) {
+    statusLine.textContent = 'click four corners first';
+    return;
+  }
+  const res = await fetch('/api/calibration', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ aspect, depth, linear, corners: corners.map((c) => [c.x, c.y]) }),
+  });
+  if (res.ok) {
+    statusLine.textContent = 'calibration saved';
+  } else {
+    const body = await res.json().catch(() => ({}));
+    statusLine.textContent = 'not saved: ' + (body.error || res.status);
+  }
+}
+
+function savePng() {
+  const out = document.createElement('canvas');
+  out.width = view.width;
+  out.height = view.height;
+  const box = out.getContext('2d');
+  if (img.naturalWidth) box.drawImage(img, 0, 0, out.width, out.height);
+  box.drawImage(view, 0, 0);
+  out.toBlob((blob) => {
+    if (!blob) return;
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'neewertv-calibration-' + Date.now() + '.png';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 5000);
+  }, 'image/png');
+}
+
+view.addEventListener('pointerdown', (event) => {
+  event.preventDefault();
+  const at = pointAt(event);
+  for (let index = 0; index < corners.length; index += 1) {
+    const dx = corners[index].x - at.x, dy = corners[index].y - at.y;
+    if (Math.hypot(dx, dy) < 0.03) {
+      drag = index;
+      view.setPointerCapture(event.pointerId);
+      return;
+    }
+  }
+  if (corners.length < 4) {
+    corners.push(at);
+    draw();
+  }
+});
+
+view.addEventListener('pointermove', (event) => {
+  if (drag < 0) return;
+  corners[drag] = pointAt(event);
+  draw();
+});
+
+['pointerup', 'pointercancel'].forEach((name) => {
+  view.addEventListener(name, () => { drag = -1; });
+});
+
+view.addEventListener('contextmenu', (event) => {
+  event.preventDefault();
+  corners.pop();
+  draw();
+});
+
+document.getElementById('aspect').addEventListener('change', (event) => {
+  const value = parseFloat(event.target.value);
+  if (value > 0.4 && value < 5) aspect = value;
+});
+document.getElementById('depth').addEventListener('input', (event) => {
+  depth = parseInt(event.target.value, 10) / 100;
+  document.getElementById('depthv').textContent = event.target.value + '%';
+  draw();
+});
+document.getElementById('linear').addEventListener('change', (event) => {
+  linear = event.target.checked;
+});
+document.getElementById('save').addEventListener('click', saveCalibration);
+document.getElementById('png').addEventListener('click', savePng);
+
+async function loadSaved() {
+  try {
+    const res = await fetch('/api/calibration');
+    if (!res.ok) return;
+    const saved = await res.json();
+    corners = saved.corners.map(([x, y]) => ({ x, y }));
+    aspect = saved.aspect;
+    depth = saved.depth;
+    linear = saved.linear;
+    document.getElementById('aspect').value = aspect.toFixed(4);
+    const percent = Math.round(depth * 100);
+    document.getElementById('depth').value = String(percent);
+    document.getElementById('depthv').textContent = percent + '%';
+    document.getElementById('linear').checked = linear;
+  } catch (err) {
+    // Nothing saved yet: the first run starts with no corners, as it should.
+  }
+}
+
+loadSaved().then(refresh);
+</script>
+"#;
 
 /// Liveness of the process, which is all Docker needs to decide whether to
 /// restart the container.
@@ -155,6 +503,205 @@ async fn api_state(State(state): State<AppState>) -> Json<Value> {
 /// The tail of the log, newest last.
 async fn api_logs(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "lines": state.logs.snapshot() }))
+}
+
+/// The camera as a stream a plain `<img>` can consume.
+///
+/// `multipart/x-mixed-replace` is the oldest trick in the book and still the
+/// right one here: no WebSocket, no JavaScript decoder, and the browser drops the
+/// connection the moment the tab stops looking at it, which is also how the
+/// camera stops being read twice.
+async fn preview(State(state): State<AppState>) -> Response {
+    let Some(ambient) = state.ambient.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let stream = futures::stream::unfold(ambient.frames(), |mut frames| async move {
+        loop {
+            if frames.changed().await.is_err() {
+                return None;
+            }
+            let frame = {
+                let borrowed = frames.borrow_and_update();
+                (*borrowed).clone()
+            };
+            let Some(frame) = frame else {
+                continue;
+            };
+
+            let mut part = Vec::with_capacity(frame.jpeg.len() + 96);
+            part.extend_from_slice(
+                format!(
+                    "--{PREVIEW_BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                    frame.jpeg.len()
+                )
+                .as_bytes(),
+            );
+            part.extend_from_slice(&frame.jpeg);
+            part.extend_from_slice(b"\r\n");
+            return Some((Ok::<Bytes, std::io::Error>(Bytes::from(part)), frames));
+        }
+    });
+
+    match Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/x-mixed-replace; boundary={PREVIEW_BOUNDARY}"),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(stream))
+    {
+        Ok(response) => response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// The latest reading: twenty colours plus the outlines they were taken from.
+///
+/// The outlines are sent rather than the homography because the page only has to
+/// draw them: one implementation of the geometry, in Rust, which cannot drift
+/// from the one that did the sampling.
+async fn api_ambient(State(state): State<AppState>) -> Response {
+    let Some(ambient) = state.ambient.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(latest) = ambient.latest() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "the camera has not produced a frame yet" })),
+        )
+            .into_response();
+    };
+
+    let zones: Vec<Value> = latest
+        .outlines
+        .iter()
+        .zip(latest.colours.iter())
+        .zip(latest.clipped.iter())
+        .map(|((outline, colour), clipped)| {
+            json!({
+                "colour": { "r": colour[0], "g": colour[1], "b": colour[2] },
+                "clipped": clipped,
+                "outline": outline
+                    .iter()
+                    .map(|point| json!([point[0], point[1]]))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "calibrated": latest.calibrated,
+        "frame": { "width": latest.frame.width, "height": latest.frame.height },
+        "fps": latest.fps,
+        "clipped_zones": latest.clipped_zones,
+        "zones": zones,
+    }))
+    .into_response()
+}
+
+/// The calibration that is currently on disk and in use.
+async fn api_calibration(State(state): State<AppState>) -> Response {
+    let Some(ambient) = state.ambient.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match ambient.calibration() {
+        Some(calibration) => {
+            Json(serde_json::to_value(&*calibration).unwrap_or(Value::Null)).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// What the page sends back after four corners have been clicked.
+#[derive(Debug, Deserialize)]
+struct CalibrationRequest {
+    aspect: f32,
+    depth: f32,
+    #[serde(default)]
+    linear: Option<bool>,
+    corners: Vec<[f32; 2]>,
+}
+
+/// Persist a calibration and put it to work immediately.
+async fn api_calibration_save(
+    State(state): State<AppState>,
+    Json(request): Json<CalibrationRequest>,
+) -> Response {
+    let Some(ambient) = state.ambient.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    // The frame size is taken from the camera, not from the request: it is the
+    // size the corners were clicked against, and the page's idea of it comes
+    // from the same place anyway.
+    let Some(latest) = ambient.latest() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "the camera has not produced a frame yet" })),
+        )
+            .into_response();
+    };
+
+    if request.corners.len() != ambient::CORNERS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "expected {} corners, got {}",
+                    ambient::CORNERS,
+                    request.corners.len()
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    let mut corners = [[0.0_f32; 2]; ambient::CORNERS];
+    for (slot, point) in corners.iter_mut().zip(request.corners) {
+        *slot = point;
+    }
+
+    let calibration = ambient::Calibration {
+        version: ambient::CALIBRATION_VERSION,
+        frame: latest.frame,
+        aspect: request.aspect,
+        depth: request.depth,
+        linear: request.linear.unwrap_or(true),
+        corners,
+    };
+
+    match ambient.save(calibration) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        // A refused calibration is the operator's problem, not the server's, so
+        // the reason goes back to the page rather than into the log alone.
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// The calibration page.
+///
+async fn calibrate(State(state): State<AppState>) -> Response {
+    if state.ambient.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mut page = format!(
+        "<!doctype html><meta charset=utf-8>\
+         <meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <title>{name} &mdash; calibration</title>{style}{extra}",
+        name = escape_html(&state.device_name),
+        style = PAGE_STYLE,
+        extra = CALIBRATION_STYLE,
+    );
+    page.push_str(CALIBRATION_TOP);
+    page.push_str(TABS_CALIBRATE);
+    page.push_str(CALIBRATION_BOTTOM);
+    Html(page).into_response()
 }
 
 /// Minimal HTML escaping for the values interpolated into the page.
@@ -226,7 +773,12 @@ h2,dt,.sub,footer,.meta{color:#9aa3af}
 .pill{background:#20252c;color:#c3c9d2}
 .swatch{border-color:rgba(255,255,255,.14)}
 pre#logs{background:#0b0d10;border:1px solid #23272e}
+.tabs a{background:#20252c;color:#c3c9d2}
+.tabs a.on{background:#e7e9ee;color:#101215}
 }
+.tabs{display:flex;gap:.4rem;margin:0 0 1.15rem;flex-wrap:wrap}
+.tabs a{padding:.4rem .9rem;border-radius:999px;text-decoration:none;font-size:.9rem;font-weight:500;color:#4b5563;background:#eef1f5}
+.tabs a.on{background:#14161a;color:#fff}
 </style>";
 
 /// Page behaviour: refresh the readout and the log tail. Nothing writes.
@@ -391,6 +943,7 @@ async fn index(State(state): State<AppState>) -> Html<String> {
          <header><div class=\"ident\"><h1>{name}</h1><p class=\"meta\" id=\"s-ident\">{identity}</p></div>\
          <span class=\"pill\" id=\"s-pill\" data-state=\"{link_state}\" title=\"{link_hint}\">{link_label}</span>\
          </header>\
+         {tabs}\
          <section class=\"card hero\">\
          <div class=\"swatch\" id=\"s-swatch\" style=\"{swatch}\"></div>\
          <div><p class=\"big\" id=\"s-power\">{power}</p>\
@@ -416,6 +969,11 @@ async fn index(State(state): State<AppState>) -> Html<String> {
         link_label = link_label,
         link_hint = escape_html(&link_hint),
         identity = identity,
+        tabs = if state.ambient.is_some() && state.mode.permits_calibration() {
+            TABS_MONITOR
+        } else {
+            ""
+        },
         swatch = swatch,
         power = if snapshot.on { "on" } else { "off" },
         subtitle = subtitle,
@@ -509,6 +1067,7 @@ mod tests {
             device_name: "TV Backlight".to_owned(),
             configured_address: configured.map(str::to_owned),
             version: "0.0.0".to_owned(),
+            ambient: None,
         };
 
         index(State(state)).await.0

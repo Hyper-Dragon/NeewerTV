@@ -10,8 +10,14 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS chef
 # btleplug talks to BlueZ through the C libdbus, so the headers have to be here
 # at build time even though the daemon never loads them itself. See the runtime
 # stage for the corresponding library.
+#
+# clang is not for us either: `v4l` pulls `v4l2-sys-mit`, which runs bindgen over
+# the kernel's `videodev2.h` *at build time*. Without libclang that build script
+# panics with "Unable to find libclang", which reads like a broken checkout rather
+# than a missing apt package. None of it reaches the runtime image.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config \
+ && apt-get install -y --no-install-recommends \
+      libdbus-1-dev pkg-config clang libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --locked
 WORKDIR /src

@@ -41,9 +41,18 @@ fn build_version() -> String {
     }
 }
 
+/// Whether ambient capture has anything to do.
+///
+/// Two independent reasons to run: the calibration screen is being served, or a
+/// calibration has already been saved and the sampler should use it. The second
+/// is what lets the operator calibrate once and then drop back to `observe` or
+/// `off` without turning the feature off.
+fn ambient_enabled(config: &Config) -> bool {
+    config.web.permits_calibration() || config.ambient.calibration.exists()
+}
+
 /// The flag the container's `HEALTHCHECK` invokes.
 const FLAG_HEALTHCHECK: &str = "--healthcheck";
-
 /// The status line a healthy probe must see.
 const HTTP_OK: &str = "HTTP/1.1 200";
 
@@ -180,6 +189,28 @@ async fn run() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     spawn_signal_handler(shutdown.clone());
 
+    // Ambient capture needs V4L2, which only exists on Linux. Saying so at startup
+    // is the difference between "the camera is not plugged in" and "this build
+    // cannot see cameras at all".
+    if config.web.permits_calibration() && !cfg!(target_os = "linux") {
+        anyhow::bail!(
+            "WEB_INTERFACE=ambient needs Linux V4L2 capture, which this build does not have; \
+             use WEB_INTERFACE=observe here and run the calibration on the deployment host"
+        );
+    }
+
+    // The camera runs when it has something to do: either the operator is on the
+    // calibration page, or a calibration already exists — in which case sampling
+    // continues even with the page switched off, which is the whole point of
+    // calibrating a camera that never moves again.
+    let ambient = ambient_enabled(&config).then(|| {
+        neewertv::ambient::start(
+            config.ambient.camera.clone(),
+            config.ambient.calibration.clone(),
+            shutdown.clone(),
+        )
+    });
+
     // The worker owns the link; everything else holds a handle.
     let (command_tx, command_rx) = mpsc::channel::<Message>(32);
     let (snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
@@ -232,6 +263,7 @@ async fn run() -> anyhow::Result<()> {
         shutdown.clone(),
         logs.clone(),
         version.clone(),
+        ambient,
     ));
 
     // A failure in any one of these is fatal: a daemon that has lost its broker
@@ -303,6 +335,7 @@ async fn serve_web(
     shutdown: CancellationToken,
     logs: neewertv::logs::LogBuffer,
     version: String,
+    ambient: Option<neewertv::ambient::Handle>,
 ) -> anyhow::Result<()> {
     if !config.web.is_enabled() {
         tracing::info!("web interface disabled; MQTT only");
@@ -341,6 +374,7 @@ async fn serve_web(
         device_name: config.device.name.clone(),
         configured_address: config.ble.address.clone(),
         version,
+        ambient,
     });
 
     axum::serve(listener, app)

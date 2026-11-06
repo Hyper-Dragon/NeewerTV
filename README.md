@@ -334,11 +334,45 @@ the compose file.
 | `BLE_DEVICE_ADDRESS` | — | Which strip this container owns, when more than one matches. Leave it unset with a single strip. |
 | `BLE_SCAN_SECONDS` | `12` | How long to scan before concluding the strip isn't there. Raise it if yours is slow to advertise. |
 | `BLE_KEEPALIVE_SECONDS` | `20` | Poke an idle link this often. These strips have been seen closing a connection they've heard nothing on — about 41 seconds, measured — so the default sits comfortably inside that window. It isn't a cure for every drop: links have also been lost at 344 s and 40 s with the keep-alive running. Lower it if yours is more impatient; `0` sends nothing. |
-| `WEB_INTERFACE` | `observe` | `off` or `observe`. Observe serves the status page and the log tail; there is no control surface, because MQTT already is one. |
+| `WEB_INTERFACE` | `observe` | `off`, `observe` or `ambient`. Observe serves the status page and the log tail; there is no control surface for the light, because MQTT already is one. `ambient` adds the camera calibration screen — see [Ambient calibration](#ambient-calibration). |
 | `WEB_BIND` | `0.0.0.0:8080` | Where the web page listens. |
+| `AMBIENT_CAMERA` | `/dev/video0` | The V4L2 device the ambient sampler reads. Only used when ambient capture is on. |
+| `AMBIENT_CALIBRATION` | `/data/ambient-calibration.json` | Where the four clicked corners live. Put it on a volume, or you re-click after every update. |
 | `LOG_LEVEL` | `info` | A `tracing` directive, so `info,neewertv::ble=debug` works. |
 | `LOG_FORMAT` | `text` | `text`, or `json` if you're shipping logs somewhere. |
 | `DBUS_SYSTEM_BUS_ADDRESS` | — | Set to `unix:path=/run/dbus/system_bus_socket` inside the container. The compose file does it for you. |
+
+## Ambient calibration
+
+> **Experimental, and not connected to the strip yet.** The calibration screen,
+> the capture and the sampler all run; nothing sends the twenty colours anywhere.
+> Details and the geometry: [`docs/AMBIENT.md`](docs/AMBIENT.md).
+
+A camera pointed at the screen, four clicked corners, and twenty sampled colours —
+one per addressable segment. No screen capture and no display-server access: the
+container owns the camera, and the browser is only used for the one-off calibration.
+
+```yaml
+services:
+  neewertv:
+    environment:
+      WEB_INTERFACE: ambient
+    devices:
+      - /dev/video0:/dev/video0
+    volumes:
+      - ./data:/data
+```
+
+Open `/calibrate`, click the four corners of the screen — top-left, top-right,
+bottom-right, bottom-left — and save. The calibration is written to
+`AMBIENT_CALIBRATION` and read back on every start, so a camera that never moves is
+only calibrated once.
+
+Then set `WEB_INTERFACE` back to `observe` or `off` if you would rather not serve
+the page: the sampler keeps running from the saved calibration either way.
+
+It needs Linux (V4L2) and a camera that offers MJPEG at 640×480. The container runs
+as root, so the device node needs no group.
 
 ## Known Issues
 
