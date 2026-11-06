@@ -233,10 +233,8 @@ fn capture(
     use anyhow::Context as _;
     use v4l::buffer::Type;
     use v4l::device::Device;
-    use v4l::format::{Format, FourCC};
     use v4l::io::mmap::Stream;
     use v4l::io::traits::CaptureStream as _;
-    use v4l::video::Capture as _;
 
     let device = Device::with_path(path)
         .map_err(|err| anyhow::anyhow!("opening {}: {err}", path.display()))?;
@@ -271,7 +269,7 @@ fn capture(
                     let _ = reply.send(list_controls(&device));
                 }
                 CameraRequest::Set { id, value, reply } => {
-                    let _ = reply.send(set_control(&device, id, value));
+                    let _ = reply.send(set_control(&device, id, value).map_err(|err| err.to_string()));
                 }
                 CameraRequest::Quiet { id, value } => {
                     let _ = set_control(&device, id, value);
@@ -411,7 +409,6 @@ pub fn list_controls(device: &v4l::device::Device) -> Vec<super::CameraControl> 
 #[cfg(target_os = "linux")]
 pub fn set_control(device: &v4l::device::Device, id: u32, value: i64) -> anyhow::Result<()> {
     use v4l::control::{Control, Value};
-    use v4l::video::Capture as _;
 
     device
         .set_control(Control {
