@@ -110,6 +110,25 @@ Tier 0 only: no calibration pass, just better arithmetic.
 - Output rounds rather than truncates: a flat 128 comes back as 127.9999 and
   truncation would report 127, making a lossless round trip look lossy.
 
+## What the strip is actually sent
+
+`rgb_to_hsi` reports what the camera saw. The firmware does not render that well,
+so a reading is lifted on the way out (`src/ambient/render.rs`):
+
+- **Saturation is multiplied** — `AMBIENT_SATURATION_GAIN`, default 2. A dim,
+  desaturated sample, which is what an averaged low-light frame produces, comes
+  back from the firmware as near-white instead of as the colour it describes.
+- **Lightness is scaled above a small floor** — `AMBIENT_LIGHTNESS_GAIN`, default
+  1.4, floor 8. Measured on an NS03: segments do not light at all below about
+  L=20. The floor exists so that a genuinely dark scene stays dark; lifting every
+  zone by a constant would make a black film glow, which is the defect the whole
+  feature exists to avoid.
+
+Hue is never touched. Both gains are guesses about the device's transfer curve,
+which is why they are settings rather than constants — measuring the curve, with
+the camera pointed at the strip's own light and a known (lightness, saturation)
+grid, is what would turn them into facts.
+
 ## Not done yet
 
 - The mode as a selectable state: a preview that only runs while a page is open is

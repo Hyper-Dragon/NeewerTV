@@ -339,6 +339,8 @@ the compose file.
 | `AMBIENT_CAMERA` | `/dev/video0` | The V4L2 device the ambient sampler reads. Only used when ambient capture is on. |
 | `AMBIENT_CALIBRATION` | `/data/ambient-calibration.json` | Where the four clicked corners live. Put it on a volume, or you re-click after every update. |
 | `AMBIENT_MAX_FPS` | `15` | Upper bound on samples per second, `0` for no bound. It bounds the work on a small box with an eager camera; the Bluetooth link cannot carry more than this anyway. |
+| `AMBIENT_SATURATION_GAIN` | `2.0` | How hard a sampled colour's saturation is pushed before it is sent. The firmware renders low saturation as white, so this is what stops a dim scene coming out colourless. |
+| `AMBIENT_LIGHTNESS_GAIN` | `1.4` | Scale applied to lightness above the firmware's dead zone — segments do not light at all below about L=20. Black stays black, because the gain only applies above a small floor. |
 | `LOG_LEVEL` | `info` | A `tracing` directive, so `info,neewertv::ble=debug` works. |
 | `LOG_FORMAT` | `text` | `text`, or `json` if you're shipping logs somewhere. |
 | `DBUS_SYSTEM_BUS_ADDRESS` | — | Set to `unix:path=/run/dbus/system_bus_socket` inside the container. The compose file does it for you. |

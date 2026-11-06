@@ -15,6 +15,7 @@
 pub mod calibration;
 pub mod camera;
 pub mod geometry;
+pub mod render;
 pub mod sampling;
 
 use std::path::{Path, PathBuf};

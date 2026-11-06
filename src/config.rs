@@ -151,7 +151,7 @@ pub struct DeviceConfig {
 /// The calibration path is the durable half of the feature: the camera is bolted
 /// in one position for good, so the corners are clicked once and then read back
 /// on every start, including starts where the calibration screen is switched off.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AmbientConfig {
     /// Any V4L2 device node the container can see, e.g. `/dev/video0`.
     pub camera: PathBuf,
@@ -159,6 +159,10 @@ pub struct AmbientConfig {
     pub calibration: PathBuf,
     /// Upper bound on samples per second, zero for no bound.
     pub max_fps: u8,
+    /// Multiplier on the saturation of each segment colour.
+    pub saturation_gain: f32,
+    /// Multiplier on the lightness above the firmware's dead zone.
+    pub lightness_gain: f32,
 }
 
 /// Every environment variable the daemon reads.
@@ -184,6 +188,8 @@ pub mod env {
     pub const AMBIENT_CAMERA: &str = "AMBIENT_CAMERA";
     pub const AMBIENT_CALIBRATION: &str = "AMBIENT_CALIBRATION";
     pub const AMBIENT_MAX_FPS: &str = "AMBIENT_MAX_FPS";
+    pub const AMBIENT_SATURATION_GAIN: &str = "AMBIENT_SATURATION_GAIN";
+    pub const AMBIENT_LIGHTNESS_GAIN: &str = "AMBIENT_LIGHTNESS_GAIN";
     pub const WEB_INTERFACE: &str = "WEB_INTERFACE";
     pub const WEB_BIND: &str = "WEB_BIND";
     pub const LOG_LEVEL: &str = "LOG_LEVEL";
@@ -243,6 +249,11 @@ pub mod default {
     /// carry. It exists to bound the work on a small box with an eager camera,
     /// not because the sampler is slow; zero means no cap at all.
     pub const AMBIENT_MAX_FPS: u8 = 15;
+    /// How hard a sampled colour is pushed towards what the firmware renders
+    /// well. Both are guesses about the device's transfer curve until somebody
+    /// measures it, which is why they are settings rather than constants.
+    pub const AMBIENT_SATURATION_GAIN: f32 = 2.0;
+    pub const AMBIENT_LIGHTNESS_GAIN: f32 = 1.4;
 }
 
 /// Which alert colours to publish as buttons, and how long they last.
@@ -260,7 +271,7 @@ pub struct AlertConfig {
 }
 
 /// Everything the daemon needs to start.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub web: WebMode,
     pub web_bind: SocketAddr,
@@ -339,6 +350,18 @@ impl Config {
             ),
             max_fps: parse_or(&get, env::AMBIENT_MAX_FPS, default::AMBIENT_MAX_FPS)?
                 .min(MAX_AMBIENT_FPS),
+            saturation_gain: parse_or(
+                &get,
+                env::AMBIENT_SATURATION_GAIN,
+                default::AMBIENT_SATURATION_GAIN,
+            )?
+            .clamp(0.0, 8.0),
+            lightness_gain: parse_or(
+                &get,
+                env::AMBIENT_LIGHTNESS_GAIN,
+                default::AMBIENT_LIGHTNESS_GAIN,
+            )?
+            .clamp(0.0, 8.0),
         };
 
         Ok(Self {
@@ -632,6 +655,8 @@ mod tests {
             PathBuf::from("/data/ambient-calibration.json")
         );
         assert_eq!(parsed.ambient.max_fps, 15);
+        assert_eq!(parsed.ambient.saturation_gain, 2.0);
+        assert_eq!(parsed.ambient.lightness_gain, 1.4);
     }
 
     #[test]

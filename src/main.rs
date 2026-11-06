@@ -60,6 +60,7 @@ fn spawn_ambient_bridge(
     ambient: neewertv::ambient::Handle,
     commands: mpsc::Sender<Message>,
     snapshot: watch::Receiver<Snapshot>,
+    render: neewertv::ambient::render::Render,
 ) {
     tokio::spawn(async move {
         let mut watching = ambient.watching();
@@ -122,24 +123,17 @@ fn spawn_ambient_bridge(
                 .map_or(1000, |level| (u32::from(level) * 1000 + 127) / 255)
                 as u16;
 
-            let entries = reading
-                .colours
-                .iter()
-                .map(|[red, green, blue]| {
-                    let hsi = neewertv::protocol::hsi::rgb_to_hsi(*red, *green, *blue);
-                    (hsi.lightness, hsi.hue, hsi.saturation)
-                })
-                .collect::<Vec<_>>();
+            let entries = neewertv::ambient::render::entries(&reading.colours, render);
 
-            if commands
-                .send(Message::Ambient {
-                    entries,
-                    brightness,
-                })
-                .await
-                .is_err()
-            {
-                break;
+            // Dropped rather than queued when the worker is behind: a colour from
+            // two frames ago is worse than no colour, and the link is slower than
+            // the camera by a wide margin.
+            match commands.try_send(Message::Ambient {
+                entries,
+                brightness,
+            }) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
             }
         }
     });
@@ -314,7 +308,16 @@ async fn run() -> anyhow::Result<()> {
     // and nothing else. The preview stream is the lease, so leaving the page is
     // what puts the strip back.
     if let Some(handle) = &ambient {
-        spawn_ambient_bridge(handle.clone(), command_tx.clone(), snapshot_rx.clone());
+        spawn_ambient_bridge(
+            handle.clone(),
+            command_tx.clone(),
+            snapshot_rx.clone(),
+            neewertv::ambient::render::Render {
+                saturation_gain: config.ambient.saturation_gain,
+                lightness_gain: config.ambient.lightness_gain,
+                ..Default::default()
+            },
+        );
     }
 
     let link = BluetoothLink::new(
