@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, watch};
 use crate::app::alerts::{AlertSpec, Alerts, Beat, Fire, Restore};
 use crate::app::command::{self, Command};
 use crate::app::queue::{Batch, Coalescer};
-use crate::ble::link::{Link, LinkError};
+use crate::ble::link::{Link, LinkError, WriteKind};
 use crate::ble::recovery::{LinkEvent, Recovery, Step};
 use crate::protocol::catalogue::{self, Kind};
 use crate::protocol::command as wire;
@@ -142,6 +142,13 @@ pub struct Snapshot {
     pub commands_received: u64,
     pub commands_coalesced: u64,
     pub writes_sent: u64,
+    /// Ambient frames that were superseded before they could be written.
+    ///
+    /// Not a fault: the camera samples faster than the link can carry, and a
+    /// colour the screen has already left behind is not worth sending. It is
+    /// worth counting, because it is the difference between the rate the page
+    /// shows and the rate the strip actually updates at.
+    pub frames_skipped: u64,
     pub last_error: Option<String>,
 }
 
@@ -362,7 +369,11 @@ impl<L: Link> Worker<L> {
                         && self.now.saturating_sub(self.last_traffic) >= self.keepalive_ms
                     {
                         self.last_traffic = self.now;
-                        match self.link.write(&wire::query_state(true)).await {
+                        match self
+                            .link
+                            .write(&wire::query_state(true), WriteKind::Acknowledged)
+                            .await
+                        {
                             Ok(()) => {
                                 // Read the answer, and discard it. Nobody asked a
                                 // question here — this is housekeeping — but an
@@ -433,9 +444,32 @@ impl<L: Link> Worker<L> {
                 }
 
                 Message::Ambient {
-                    entries,
-                    brightness,
+                    mut entries,
+                    mut brightness,
                 } => {
+                    // Only the newest colour is worth writing. The camera samples
+                    // faster than the link can carry, so anything already queued
+                    // behind this one is a colour the screen has moved past —
+                    // writing the backlog makes the strip lag by seconds while it
+                    // replays a history nobody asked for.
+                    let mut skipped = 0_u32;
+                    while let Ok(next) = rx.try_recv() {
+                        match next {
+                            Message::Ambient {
+                                entries: newer,
+                                brightness: level,
+                            } => {
+                                entries = newer;
+                                brightness = level;
+                                skipped += 1;
+                            }
+                            // Anything else keeps its place: it was queued after
+                            // this frame, so it is handled after it.
+                            other => deferred.push_back(other),
+                        }
+                    }
+                    self.snapshot.frames_skipped += u64::from(skipped);
+
                     // No preview running means the page was closed mid-flight, or
                     // a user command ended it. Either way this frame is stale.
                     if self.ambient.is_some() {
@@ -444,7 +478,9 @@ impl<L: Link> Worker<L> {
                             brightness,
                         }) {
                             Ok(frames) => {
-                                if let Err(failure) = self.write_all(&frames).await {
+                                if let Err(failure) =
+                                    self.write_all_as(&frames, WriteKind::Unacknowledged).await
+                                {
                                     self.snapshot.last_error = Some(failure.error.to_string());
                                 }
                             }
@@ -501,7 +537,7 @@ impl<L: Link> Worker<L> {
     async fn read_device_state(&mut self) {
         self.state_queried = true;
         let query = wire::query_state(true);
-        if let Err(err) = self.link.write(&query).await {
+        if let Err(err) = self.link.write(&query, WriteKind::Acknowledged).await {
             tracing::debug!(%err, "state query could not be written");
             return;
         }
@@ -782,7 +818,11 @@ impl<L: Link> Worker<L> {
     /// there by the time anyone reads it. The colour and brightness are adopted
     /// under the same rule as everywhere else — only when nothing better is known.
     async fn read_presentation(&mut self, timeout: Duration) {
-        if let Err(err) = self.link.write(&wire::query_state(true)).await {
+        if let Err(err) = self
+            .link
+            .write(&wire::query_state(true), WriteKind::Acknowledged)
+            .await
+        {
             tracing::debug!(%err, "alert-time state query could not be written");
             return;
         }
@@ -896,12 +936,21 @@ impl<L: Link> Worker<L> {
     }
 
     async fn write_all(&mut self, frames: &[Vec<u8>]) -> Result<(), AttachFailure> {
+        self.write_all_as(frames, WriteKind::Acknowledged).await
+    }
+
+    /// Write frames, saying whether the strip has to acknowledge each one.
+    async fn write_all_as(
+        &mut self,
+        frames: &[Vec<u8>],
+        kind: WriteKind,
+    ) -> Result<(), AttachFailure> {
         if !self.link.is_up().await {
             self.attach().await?;
         }
 
         for frame in frames {
-            match self.link.write(frame).await {
+            match self.link.write(frame, kind).await {
                 Ok(()) => {
                     self.snapshot.writes_sent += 1;
                     self.last_traffic = self.now;
@@ -1010,6 +1059,8 @@ mod tests {
         report: Option<StateReport>,
         /// Command frames.
         writes: Vec<Vec<u8>>,
+        /// How many of those were written without waiting for an acknowledgement.
+        unacknowledged: u32,
         /// State queries, counted apart so a test can talk about commands without
         /// having to filter them out of `writes`.
         queries: u32,
@@ -1051,7 +1102,7 @@ mod tests {
             })
         }
 
-        fn write(&mut self, frame: &[u8]) -> BoxFuture<'_, Result<(), LinkError>> {
+        fn write(&mut self, frame: &[u8], kind: WriteKind) -> BoxFuture<'_, Result<(), LinkError>> {
             let frame = frame.to_vec();
             Box::pin(async move {
                 let mut state = self.state.lock().unwrap();
@@ -1065,6 +1116,9 @@ mod tests {
                 if frame.get(1) == Some(&ID_QUERY_STATE) {
                     state.queries += 1;
                 } else {
+                    if kind == WriteKind::Unacknowledged {
+                        state.unacknowledged += 1;
+                    }
                     state.writes.push(frame);
                 }
                 Ok(())
@@ -1106,6 +1160,14 @@ mod tests {
     fn brightness(level: u16) -> Batch {
         Batch {
             commands: vec![Command::Brightness(level)],
+        }
+    }
+
+    /// One ambient frame, coloured so that which one was written is visible.
+    fn ambient(red: u8) -> Message {
+        Message::Ambient {
+            entries: vec![(50, 0, red); 20],
+            brightness: 1000,
         }
     }
 
@@ -2043,6 +2105,57 @@ mod tests {
         .await;
 
         assert_eq!(snapshot.effect.as_deref(), Some("Superfluid"));
+    }
+
+    #[tokio::test]
+    async fn only_the_newest_queued_ambient_frame_is_written() {
+        // The camera samples faster than the link can carry. Writing the backlog
+        // makes the strip replay a history the screen has already left behind, so
+        // the queue is drained and only the last frame survives.
+        let (link, _) = FakeLink::new(0);
+        let state = drain(
+            Worker::new(link),
+            vec![Message::AmbientStart, ambient(10), ambient(20), ambient(30)],
+        )
+        .await;
+
+        let state = state.lock().unwrap();
+        // One write to wake the strip, then exactly one frame: the last one.
+        assert_eq!(state.writes.len(), 2, "three frames, one write");
+        let last = state.writes.last().expect("a frame was written");
+        assert!(
+            // Segments go out as (lightness, hue high, hue low, saturation), so
+            // the third frame's saturation of 30 is what identifies it.
+            last.windows(4).any(|window| window == [50, 0, 0, 30]),
+            "the surviving frame must be the newest, got {last:02x?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ambient_frame_does_not_wait_for_an_acknowledgement() {
+        // This is the whole update rate on a link with a slow connection
+        // interval: an acknowledged write costs a round trip, and twenty a second
+        // is beyond what one costs.
+        let (link, state) = FakeLink::new(0);
+        drain(Worker::new(link), vec![Message::AmbientStart, ambient(30)]).await;
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.unacknowledged, 1,
+            "the camera frame takes the fast path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_command_is_still_acknowledged() {
+        // The fast path is for colours that will be replaced in 66 ms. Anything
+        // whose loss someone would notice keeps its acknowledgement.
+        let (link, state) = FakeLink::new(0);
+        drain(Worker::new(link), vec![Message::Batch(brightness(500))]).await;
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.unacknowledged, 0);
+        assert!(!state.writes.is_empty());
     }
 
     #[tokio::test]

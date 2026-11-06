@@ -18,12 +18,12 @@
 use std::pin::Pin;
 use std::time::Duration;
 
-use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
+use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::{Stream, StreamExt as _};
 
 use crate::ble::discovery;
-use crate::ble::link::{BoxFuture, Link, LinkError};
+use crate::ble::link::{BoxFuture, Link, LinkError, WriteKind};
 use crate::protocol::command::ID_STATE_REPORT;
 use crate::protocol::state::StateReport;
 
@@ -56,6 +56,10 @@ type NotificationStream = Pin<Box<dyn Stream<Item = btleplug::api::ValueNotifica
 struct Attached {
     device: Peripheral,
     write_char: btleplug::api::Characteristic,
+    /// Whether the strip's write characteristic accepts a write with no
+    /// acknowledgement. Worth knowing at attach time: once something is driving
+    /// it twenty times a second, that difference is the whole update rate.
+    unacknowledged: bool,
     notifications: NotificationStream,
     address: String,
     /// Signal strength at connect, when the host reports one.
@@ -82,6 +86,8 @@ pub struct BluetoothLink {
     adapter: Option<Adapter>,
     device: Option<Peripheral>,
     write_char: Option<btleplug::api::Characteristic>,
+    /// Whether the characteristic accepts a write with no acknowledgement.
+    unacknowledged: bool,
     notifications: Option<NotificationStream>,
     current_address: String,
     rssi: Option<i16>,
@@ -97,6 +103,7 @@ impl BluetoothLink {
             adapter: None,
             device: None,
             write_char: None,
+            unacknowledged: false,
             notifications: None,
             current_address: String::new(),
             rssi: None,
@@ -165,7 +172,7 @@ async fn connect_device(
     // makes the strip invisible to the next scan — the very state `clear_stale`
     // exists to undo, and only after a wasted scan and a 1.5 s wait.
     match prepare(&device).await {
-        Ok((write_char, notifications)) => {
+        Ok((write_char, notifications, unacknowledged)) => {
             let rssi = device
                 .properties()
                 .await
@@ -175,6 +182,7 @@ async fn connect_device(
             Ok(Attached {
                 device,
                 write_char,
+                unacknowledged,
                 notifications,
                 address,
                 rssi,
@@ -191,7 +199,7 @@ async fn connect_device(
 /// single place to clean up from.
 async fn prepare(
     device: &Peripheral,
-) -> Result<(btleplug::api::Characteristic, NotificationStream), LinkError> {
+) -> Result<(btleplug::api::Characteristic, NotificationStream, bool), LinkError> {
     device
         .discover_services()
         .await
@@ -208,6 +216,19 @@ async fn prepare(
     let write_char = find_characteristic(device, WRITE_UUID)?;
     let notify_char = find_characteristic(device, NOTIFY_UUID)?;
 
+    let unacknowledged = write_char
+        .properties
+        .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE);
+    tracing::info!(
+        unacknowledged,
+        "write characteristic properties: {}",
+        if unacknowledged {
+            "acknowledged and unacknowledged writes"
+        } else {
+            "acknowledged writes only"
+        }
+    );
+
     device
         .subscribe(&notify_char)
         .await
@@ -217,7 +238,7 @@ async fn prepare(
         .await
         .map_err(|err| LinkError::Connect(format!("notification stream: {err}")))?;
 
-    Ok((write_char, notifications))
+    Ok((write_char, notifications, unacknowledged))
 }
 
 /// Scan until a name match appears, then choose — or refuse.
@@ -431,6 +452,7 @@ impl Link for BluetoothLink {
 
             self.device = Some(attached.device);
             self.write_char = Some(attached.write_char);
+            self.unacknowledged = attached.unacknowledged;
             self.notifications = Some(attached.notifications);
             self.current_address = attached.address;
             self.rssi = attached.rssi;
@@ -438,7 +460,11 @@ impl Link for BluetoothLink {
         })
     }
 
-    fn write<'a>(&'a mut self, frame: &'a [u8]) -> BoxFuture<'a, Result<(), LinkError>> {
+    fn write<'a>(
+        &'a mut self,
+        frame: &'a [u8],
+        kind: WriteKind,
+    ) -> BoxFuture<'a, Result<(), LinkError>> {
         Box::pin(async move {
             let device = self
                 .device
@@ -449,11 +475,15 @@ impl Link for BluetoothLink {
                 .as_ref()
                 .ok_or_else(|| LinkError::Write("no write characteristic".to_owned()))?;
 
-            match tokio::time::timeout(
-                WRITE_TIMEOUT,
-                device.write(write_char, frame, WriteType::WithResponse),
-            )
-            .await
+            // The fast path is the strip's to offer. A characteristic that only
+            // accepts Write Requests gets them, and the caller never has to know.
+            let write_type = match kind {
+                WriteKind::Unacknowledged if self.unacknowledged => WriteType::WithoutResponse,
+                _ => WriteType::WithResponse,
+            };
+
+            match tokio::time::timeout(WRITE_TIMEOUT, device.write(write_char, frame, write_type))
+                .await
             {
                 Ok(result) => result.map_err(|err| LinkError::Write(err.to_string())),
                 Err(_) => Err(LinkError::Write(format!(

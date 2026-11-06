@@ -39,6 +39,19 @@ pub enum LinkError {
     Protocol(#[from] ProtocolError),
 }
 
+/// Whether a write waits for the strip to acknowledge it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteKind {
+    /// ATT Write Request. The strip acknowledges every frame, so a write costs a
+    /// round trip: on a link that has negotiated a slow connection interval this
+    /// is the whole update rate.
+    Acknowledged,
+    /// ATT Write Command. Fire and forget, several times faster, at the cost of
+    /// the acknowledgement. Right for a colour that will be replaced in 66 ms;
+    /// wrong for anything whose loss would be noticed.
+    Unacknowledged,
+}
+
 /// One connection to one strip.
 pub trait Link: Send {
     /// Connect, discover services and subscribe to notifications.
@@ -48,8 +61,16 @@ pub trait Link: Send {
     /// handle refers to an object the Bluetooth stack has already destroyed.
     fn attach(&mut self) -> BoxFuture<'_, Result<(), LinkError>>;
 
-    /// Write one complete frame.
-    fn write<'a>(&'a mut self, frame: &'a [u8]) -> BoxFuture<'a, Result<(), LinkError>>;
+    /// Write one complete frame, saying whether it has to be acknowledged.
+    ///
+    /// `Unacknowledged` is a hint: an implementation whose characteristic cannot
+    /// write without a response may ignore it. The call stays correct, only
+    /// slower.
+    fn write<'a>(
+        &'a mut self,
+        frame: &'a [u8],
+        kind: WriteKind,
+    ) -> BoxFuture<'a, Result<(), LinkError>>;
 
     /// Wait for the next `0x09` state report, ignoring anything else.
     fn next_report<'a>(

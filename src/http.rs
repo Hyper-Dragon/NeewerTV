@@ -352,6 +352,34 @@ function hsvToRgb(hue, saturation, lightness) {
   return [channel(5), channel(3), channel(1)].map((v) => Math.round(v * 255));
 }
 
+// The camera samples faster than Bluetooth can carry, so the two rates are
+// measured separately and shown side by side. Without that, a change looks like
+// it worked on the swatches while the strip is still three frames behind.
+const stripMeter = { at: 0, writes: 0, skipped: 0, rate: 0, dropped: 0 };
+
+function meterStrip(strip) {
+  if (!strip) return null;
+  const now = performance.now();
+
+  // A restart zeroes the counters; a negative delta is that, not a rate.
+  if (stripMeter.at && strip.writes_sent >= stripMeter.writes && strip.frames_skipped >= stripMeter.skipped) {
+    const seconds = (now - stripMeter.at) / 1000;
+    if (seconds >= 0.8) {
+      stripMeter.rate = (strip.writes_sent - stripMeter.writes) / seconds;
+      stripMeter.dropped = (strip.frames_skipped - stripMeter.skipped) / seconds;
+      stripMeter.at = now;
+      stripMeter.writes = strip.writes_sent;
+      stripMeter.skipped = strip.frames_skipped;
+    }
+    return stripMeter;
+  }
+
+  stripMeter.at = now;
+  stripMeter.writes = strip.writes_sent;
+  stripMeter.skipped = strip.frames_skipped;
+  return stripMeter;
+}
+
 async function refresh() {
   try {
     const res = await fetch('/api/ambient');
@@ -361,9 +389,18 @@ async function refresh() {
         view.width = latest.frame.width;
         view.height = latest.frame.height;
       }
-      const bits = [latest.fps.toFixed(1) + ' fps'];
-      bits.push(latest.calibrated ? 'sampling' : 'not calibrated');
+      const bits = [latest.fps.toFixed(1) + ' fps sampled'];
+      const strip = meterStrip(latest.strip);
+      if (!latest.strip || !latest.strip.connected) {
+        bits.push('strip not connected');
+      } else if (strip && strip.rate > 0) {
+        bits.push(strip.rate.toFixed(1) + '/s to the strip');
+      }
+      if (!latest.calibrated) bits.push('not calibrated');
       if (latest.clipped_zones > 0) bits.push(latest.clipped_zones + ' over-exposed');
+      if (strip && strip.dropped >= 1) {
+        bits.push(Math.round(strip.dropped) + '/s dropped as stale');
+      }
       statusLine.textContent = bits.join(' \u00b7 ');
     } else if (res.status === 503) {
       statusLine.textContent = 'waiting for the camera';
@@ -703,6 +740,15 @@ async fn api_ambient(State(state): State<AppState>) -> Response {
         "frame": { "width": latest.frame.width, "height": latest.frame.height },
         "fps": latest.fps,
         "clipped_zones": latest.clipped_zones,
+        // What the link is actually managing. The camera samples faster than
+        // Bluetooth can carry, so these two numbers are the honest answer to
+        // "is the strip behind the page" — and they are the reason to look
+        // at the strip rather than at the swatches when judging a change.
+        "strip": {
+            "connected": state.snapshot.borrow().connected,
+            "writes_sent": state.snapshot.borrow().writes_sent,
+            "frames_skipped": state.snapshot.borrow().frames_skipped,
+        },
         "zones": zones,
     }))
     .into_response()
