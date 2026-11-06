@@ -338,6 +338,7 @@ the compose file.
 | `WEB_BIND` | `0.0.0.0:8080` | Where the web page listens. |
 | `AMBIENT_CAMERA` | `/dev/video0` | The V4L2 device the ambient sampler reads. Only used when ambient capture is on. |
 | `AMBIENT_CALIBRATION` | `/data/ambient-calibration.json` | Where the four clicked corners live. Put it on a volume, or you re-click after every update. |
+| `AMBIENT_MAX_FPS` | `15` | Upper bound on samples per second, `0` for no bound. It bounds the work on a small box with an eager camera; the Bluetooth link cannot carry more than this anyway. |
 | `LOG_LEVEL` | `info` | A `tracing` directive, so `info,neewertv::ble=debug` works. |
 | `LOG_FORMAT` | `text` | `text`, or `json` if you're shipping logs somewhere. |
 | `DBUS_SYSTEM_BUS_ADDRESS` | — | Set to `unix:path=/run/dbus/system_bus_socket` inside the container. The compose file does it for you. |
@@ -368,11 +369,17 @@ bottom-right, bottom-left — and save. The calibration is written to
 `AMBIENT_CALIBRATION` and read back on every start, so a camera that never moves is
 only calibrated once.
 
+**While the calibration page is open, the strip follows the camera** — twenty
+segments, at the brightness the light is already set to. Leaving the page puts the
+strip back exactly as it was, including switching it off again if it was off. That
+lifetime is the preview stream: no timers, and a browser that vanishes takes the
+preview with it.
+
 Then set `WEB_INTERFACE` back to `observe` or `off` if you would rather not serve
 the page: the sampler keeps running from the saved calibration either way.
 
-It needs Linux (V4L2) and a camera that offers MJPEG at 640×480. The container runs
-as root, so the device node needs no group.
+It needs Linux (V4L2) and a camera that offers MJPEG or YUYV at 640×480. The
+container runs as root, so the device node needs no group.
 
 ## Known Issues
 

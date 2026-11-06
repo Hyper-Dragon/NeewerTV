@@ -33,20 +33,41 @@ BlueZ's sake, so no group is needed; if that ever changes, the node is
 ## The pipeline
 
 ```
-V4L2 (MJPEG) → decode → Sampler ─┬→ /api/ambient  (colours + outlines, polled)
-                                 └→ /preview      (the camera's own JPEGs)
+V4L2 (MJPEG or YUYV) → pixels ─┬→ Sampler ─┬→ /api/ambient  (colours + outlines)
+                               │           └→ worker        (20 segments, while previewing)
+                               └→ /preview                 (an image per frame)
 ```
 
-- **MJPEG only.** The frames are forwarded to the browser byte for byte, so the
-  preview costs no encode at all, and the decode is paid once for the sampler.
-  A camera that refuses MJPEG is rejected by name at startup rather than silently
-  producing garbage.
+- **MJPEG first, YUYV second.** A camera that gives MJPEG has its own JPEGs
+  forwarded to the browser verbatim, so nothing is encoded at all. A camera that
+  only offers YUYV is converted here and its preview is written as an
+  uncompressed BMP at half resolution — no encoder, no crate, and a 320x180
+  picture is plenty for clicking corners. A camera offering neither is refused by
+  name rather than silently producing garbage.
+- **The frame rate is capped**, `AMBIENT_MAX_FPS`, default 15. The cap is on
+  sampling, not on the preview: frames that arrive early are dropped rather than
+  delayed, because a stale colour is worse than a missing one.
 - **One write per frame, no queue.** A `watch` channel carries the newest frame
   and the newest reading. If sampling ever fell behind, skipping frames is the
-  correct behaviour — a stale colour is worse than a fresh one.
+  correct behaviour.
 - **No geometry in the browser.** `/api/ambient` returns each zone's four corners
   already projected into the frame, so the overlay is drawn from the numbers the
   sampler used. One implementation, in Rust, that cannot drift.
+
+## The preview is the lease
+
+While the calibration page is open the strip follows the camera: twenty segments
+from the sampler, scaled by the brightness the light is already set to.
+
+The lifetime is the `/preview` stream, not a timer. It opens when the page loads
+and closes when the page is left, and the worker restores whatever the strip was
+doing before — including switching it back off if it was off. Two consequences
+worth knowing: a browser that vanishes without a clean close still ends the
+preview (the stream is dropped), and **any command from MQTT ends it too**, because
+a user asking for a colour must not be overwritten by a camera frame 66 ms later.
+
+The restore path is the alert path: capture the strip's state in both of the forms
+it may be in before taking it over, and replay the right one afterwards.
 
 ## Geometry
 
@@ -91,13 +112,19 @@ Tier 0 only: no calibration pass, just better arithmetic.
 
 ## Not done yet
 
-- Sending the colours to the strip, and the precedence rule that makes the mode
-  yield to any explicit command.
+- The mode as a selectable state: a preview that only runs while a page is open is
+  not the same thing as "this light is in ambient mode".
 - Reading the mode back from a strip that cannot report it.
 - Tiers 1–3: flat-field and black-level correction, a colour-correction matrix, and
   locking exposure. For a calibration driven by a video on the television, locking
   exposure has to happen *first*, or the white and black fields are measured at
   different gains.
+
+Aspect is fixed at 16:9 and is no longer a control on the page. Every strip this
+supports is built around a 16:9 panel, and a wrong aspect silently skews the
+section widths rather than failing — a knob that can only make things quietly
+worse is not worth a row in the UI. The value stays in the calibration file so a
+non-16:9 panel can still be described by editing it.
 
 ## Build note
 

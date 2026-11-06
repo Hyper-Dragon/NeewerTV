@@ -93,6 +93,10 @@ services:
       # once and never moves, so re-clicking after an update would defeat the point.
       # AMBIENT_CAMERA: /dev/video0
       # AMBIENT_CALIBRATION: /data/ambient-calibration.json
+      # Samples per second, 0 for no cap. The bluetooth link cannot carry more
+      # than about this anyway, and a cap keeps an old camera from eating a small
+      # box's CPU.
+      # AMBIENT_MAX_FPS: 15
       # Where the page listens inside the container. Leave it alone unless the
       # default clashes with something else in the container; to move it on the
       # host, change WEB_PORT below instead.

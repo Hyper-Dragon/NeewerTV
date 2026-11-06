@@ -18,6 +18,7 @@ pub mod geometry;
 pub mod sampling;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -140,11 +141,17 @@ pub struct Handle {
     frames: watch::Receiver<Option<Arc<Frame>>>,
     calibration: Arc<RwLock<Option<Arc<Calibration>>>>,
     path: PathBuf,
+    viewing: Arc<Viewing>,
 }
 
 impl Handle {
     pub fn latest(&self) -> Option<Arc<Latest>> {
         self.latest.borrow().clone()
+    }
+
+    /// The latest reading, for a task that wants to be told when it changes.
+    pub fn latest_changes(&self) -> watch::Receiver<Option<Arc<Latest>>> {
+        self.latest.clone()
     }
 
     /// Frames as the camera produced them, for the preview stream.
@@ -158,6 +165,26 @@ impl Handle {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Announce that a browser is looking at the calibration page.
+    ///
+    /// The preview stream *is* the lease: it opens when the page loads and closes
+    /// when the page is left, which is exactly the span over which the strip
+    /// should follow the camera. It is held until the returned guard is dropped,
+    /// which happens even when the connection dies mid-stream.
+    pub fn begin_viewing(&self) -> ViewGuard {
+        if self.viewing.open_one() {
+            let _ = self.viewing.change.send(true);
+        }
+        ViewGuard {
+            viewing: Arc::clone(&self.viewing),
+        }
+    }
+
+    /// Whether anybody is looking, for whoever drives the strip.
+    pub fn watching(&self) -> watch::Receiver<bool> {
+        self.viewing.change.subscribe()
     }
 
     /// Persist a calibration and put it to work.
@@ -174,11 +201,47 @@ impl Handle {
     }
 }
 
+/// How many preview streams are open, and a channel that says whether any are.
+struct Viewing {
+    open: AtomicUsize,
+    change: watch::Sender<bool>,
+}
+
+impl Viewing {
+    /// Returns true when this was the first viewer.
+    fn open_one(&self) -> bool {
+        self.open.fetch_add(1, Ordering::SeqCst) == 0
+    }
+
+    /// Returns true when this was the last one.
+    fn close_one(&self) -> bool {
+        self.open.fetch_sub(1, Ordering::SeqCst) == 1
+    }
+}
+
+/// Keeps a preview lease alive for as long as it is held.
+pub struct ViewGuard {
+    viewing: Arc<Viewing>,
+}
+
+impl Drop for ViewGuard {
+    fn drop(&mut self) {
+        if self.viewing.close_one() {
+            let _ = self.viewing.change.send(false);
+        }
+    }
+}
+
 /// Start capture and sampling.
 ///
 /// Returns a handle whether or not a calibration exists yet: the calibration
 /// screen needs a preview *before* there is anything to sample with.
-pub fn start(device: PathBuf, calibration_path: PathBuf, shutdown: CancellationToken) -> Handle {
+pub fn start(
+    device: PathBuf,
+    calibration_path: PathBuf,
+    max_fps: u8,
+    shutdown: CancellationToken,
+) -> Handle {
     let stored = match Calibration::load(&calibration_path) {
         Ok(calibration) => {
             info!(
@@ -211,6 +274,7 @@ pub fn start(device: PathBuf, calibration_path: PathBuf, shutdown: CancellationT
 
     let (frames_tx, frames_rx) = watch::channel(None);
     let (latest_tx, latest_rx) = watch::channel(None);
+    let (change, _) = watch::channel(false);
     let calibration = Arc::new(RwLock::new(stored));
 
     camera::spawn(device, frames_tx, shutdown.clone());
@@ -219,6 +283,7 @@ pub fn start(device: PathBuf, calibration_path: PathBuf, shutdown: CancellationT
         frames_rx.clone(),
         latest_tx,
         Arc::clone(&calibration),
+        max_fps,
         shutdown,
     ));
 
@@ -227,6 +292,10 @@ pub fn start(device: PathBuf, calibration_path: PathBuf, shutdown: CancellationT
         frames: frames_rx,
         calibration,
         path: calibration_path,
+        viewing: Arc::new(Viewing {
+            open: AtomicUsize::new(0),
+            change,
+        }),
     }
 }
 
@@ -239,11 +308,19 @@ async fn sample_frames(
     mut frames: watch::Receiver<Option<Arc<Frame>>>,
     latest: watch::Sender<Option<Arc<Latest>>>,
     calibration: Arc<RwLock<Option<Arc<Calibration>>>>,
+    max_fps: u8,
     shutdown: CancellationToken,
 ) {
     let mut sampler: Option<Sampler> = None;
     let mut sampler_for: Option<Arc<Calibration>> = None;
     let mut window = FrameWindow::default();
+
+    // A cap, not a rate: a frame that arrives early is dropped rather than
+    // delayed, because a late colour is worse than a missing one. It keeps an
+    // over-eager camera from spending a small box's whole budget on frames the
+    // strip cannot be told about in time anyway. Zero means no cap at all.
+    let interval = (max_fps > 0).then(|| Duration::from_secs_f64(1.0 / f64::from(max_fps)));
+    let mut last_sampled: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -258,6 +335,14 @@ async fn sample_frames(
         let Some(frame) = frames.borrow_and_update().clone() else {
             continue;
         };
+
+        if let Some(interval) = interval {
+            let now = Instant::now();
+            if last_sampled.is_some_and(|last| now.duration_since(last) < interval) {
+                continue;
+            }
+            last_sampled = Some(now);
+        }
 
         // Rebuild only when the calibration actually changed: a save swaps the
         // `Arc`, so pointer equality is the test and no version counter is needed.

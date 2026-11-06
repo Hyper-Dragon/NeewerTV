@@ -1,12 +1,19 @@
-//! V4L2 capture and MJPEG decode.
+//! Camera capture: pixels for the sampler, an image for the browser.
 //!
 //! The capture loop is blocking by nature — `VIDIOC_DQBUF` parks the thread until
 //! a frame arrives — so it runs on a thread of its own rather than inside the
 //! runtime, where a blocking call would stall everything else sharing that worker.
 //!
-//! MJPEG is the only pixel format asked for, and deliberately: the frames can
-//! then be forwarded to the browser exactly as the camera produced them, and the
-//! decode cost is paid once for the sampler rather than twice for a re-encode.
+//! Two codings are supported, and the order matters:
+//!
+//! * **MJPEG** is preferred. The frames are already JPEG, so the preview is the
+//!   camera's own bytes forwarded verbatim and nothing is encoded at all.
+//! * **YUYV** is the fallback for cameras that will not give MJPEG at this size.
+//!   It is converted to RGB here, and the preview is written as an uncompressed
+//!   BMP at half resolution — no encoder, no crate, and browsers have displayed
+//!   BMP since forever.
+//!
+//! Anything else is refused by name rather than silently producing garbage.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,15 +24,27 @@ use tracing::warn;
 
 use super::sampling::Frame;
 
-/// The four character code the capture asks the camera for.
-pub const FOURCC: &[u8; 4] = b"MJPG";
+/// The four character codes we know how to unpack.
+pub const MJPEG: &[u8; 4] = b"MJPG";
+pub const YUYV: &[u8; 4] = b"YUYV";
+
+/// Content types the preview can carry, one per frame.
+pub const TYPE_JPEG: &str = "image/jpeg";
+pub const TYPE_BMP: &str = "image/bmp";
+
+/// How the bytes a camera hands us have to be turned into pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coding {
+    Mjpeg,
+    Yuyv,
+}
 
 /// Decode one MJPEG frame into RGB.
 ///
 /// Platform-neutral on purpose: this is the half of capture that can be reasoned
 /// about without a camera attached, and it is where a camera that quietly emits
 /// something other than RGB24 gets caught by name rather than by a wrong picture.
-pub fn decode(jpeg: &[u8]) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+pub fn decode_mjpeg(jpeg: &[u8]) -> anyhow::Result<(u32, u32, Vec<u8>)> {
     let mut decoder = jpeg_decoder::Decoder::new(jpeg);
     let pixels = decoder
         .decode()
@@ -40,6 +59,111 @@ pub fn decode(jpeg: &[u8]) -> anyhow::Result<(u32, u32, Vec<u8>)> {
         );
     }
     Ok((u32::from(info.width), u32::from(info.height), pixels))
+}
+
+/// Turn a packed YUYV (a.k.a. YUY2) frame into RGB.
+///
+/// Two pixels share one chroma pair, which is the whole point of the format: half
+/// the bandwidth, at the cost of a colour resolution nobody can see in an average.
+pub fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
+    let pixels = (width as usize) * (height as usize);
+    let expected = pixels * 2;
+    if data.len() < expected {
+        anyhow::bail!(
+            "expected {expected} bytes of YUYV for {width}x{height}, got {}",
+            data.len()
+        );
+    }
+
+    let mut rgb = Vec::with_capacity(pixels * 3);
+    for pair in data[..expected].chunks_exact(4) {
+        let (y0, u, y1, v) = (pair[0], pair[1], pair[2], pair[3]);
+        rgb.extend_from_slice(&yuv_to_rgb(y0, u, v));
+        rgb.extend_from_slice(&yuv_to_rgb(y1, u, v));
+    }
+    rgb.truncate(pixels * 3);
+    Ok(rgb)
+}
+
+fn yuv_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
+    // BT.601 full range, which is what UVC cameras emit.
+    let luma = f32::from(y);
+    let blue_difference = f32::from(u) - 128.0;
+    let red_difference = f32::from(v) - 128.0;
+
+    [
+        clamp_byte(luma + 1.402 * red_difference),
+        clamp_byte(luma - 0.344_136 * blue_difference - 0.714_136 * red_difference),
+        clamp_byte(luma + 1.772 * blue_difference),
+    ]
+}
+
+fn clamp_byte(value: f32) -> u8 {
+    value.round().clamp(0.0, 255.0) as u8
+}
+
+/// Halve an RGB image by dropping every other pixel.
+///
+/// Nearest-neighbour on purpose: the preview exists so somebody can see where the
+/// screen's corners are, and a 320x180 picture is plenty for that. It costs a
+/// quarter of the bytes to send and a quarter of the time to write.
+pub fn halve(rgb: &[u8], width: u32, height: u32) -> (u32, u32, Vec<u8>) {
+    let half_width = (width / 2).max(1);
+    let half_height = (height / 2).max(1);
+    let stride = width as usize * 3;
+
+    let mut out = Vec::with_capacity(half_width as usize * half_height as usize * 3);
+    for y in 0..half_height as usize {
+        let row = (y * 2) * stride;
+        for x in 0..half_width as usize {
+            let offset = row + (x * 2) * 3;
+            out.extend_from_slice(&rgb[offset..offset + 3]);
+        }
+    }
+    (half_width, half_height, out)
+}
+
+/// Wrap an RGB image in an uncompressed 24-bit BMP.
+///
+/// A BMP rather than a JPEG because encoding one costs nothing and needs no
+/// crate: the header is fifty-four bytes and the rest is the pixels in BGR order.
+pub fn bmp(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
+    const HEADER: usize = 54;
+
+    let row = width as usize * 3;
+    let padding = (4 - row % 4) % 4;
+    let stride = row + padding;
+    let body = stride * height as usize;
+    let total = HEADER + body;
+
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&0_u32.to_le_bytes()); // reserved
+    out.extend_from_slice(&(HEADER as u32).to_le_bytes());
+    out.extend_from_slice(&40_u32.to_le_bytes()); // DIB header size
+    out.extend_from_slice(&(width as i32).to_le_bytes());
+    // Positive height means the rows are stored bottom-up, which is the format's
+    // own default and one less thing to get wrong.
+    out.extend_from_slice(&(height as i32).to_le_bytes());
+    out.extend_from_slice(&1_u16.to_le_bytes()); // planes
+    out.extend_from_slice(&24_u16.to_le_bytes()); // bits per pixel
+    out.extend_from_slice(&0_u32.to_le_bytes()); // no compression
+    out.extend_from_slice(&(body as u32).to_le_bytes());
+    out.extend_from_slice(&2835_u32.to_le_bytes()); // pixels per metre, 72 dpi
+    out.extend_from_slice(&2835_u32.to_le_bytes());
+    out.extend_from_slice(&0_u32.to_le_bytes()); // palette entries
+    out.extend_from_slice(&0_u32.to_le_bytes()); // important colours
+
+    let stride_bytes = width as usize * 3;
+    for y in (0..height as usize).rev() {
+        let start = y * stride_bytes;
+        for pixel in rgb[start..start + stride_bytes].chunks_exact(3) {
+            out.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+        }
+        out.resize(out.len() + padding, 0);
+    }
+    out
 }
 
 /// Open the camera and publish every frame it produces.
@@ -110,27 +234,12 @@ fn capture(
     let device = Device::with_path(path)
         .map_err(|err| anyhow::anyhow!("opening {}: {err}", path.display()))?;
 
-    let wanted = Format::new(
-        super::CAPTURE_WIDTH,
-        super::CAPTURE_HEIGHT,
-        FourCC::new(FOURCC),
-    );
-    let format = device
-        .set_format(&wanted)
-        .map_err(|err| anyhow::anyhow!("asking for MJPEG: {err}"))?;
-
-    if format.fourcc != FourCC::new(FOURCC) {
-        anyhow::bail!(
-            "the camera settled on {:?} at {}x{}, and this daemon only accepts MJPEG",
-            format.fourcc,
-            format.width,
-            format.height
-        );
-    }
+    let (format, coding) = choose_format(&device)?;
     tracing::info!(
         camera = %path.display(),
         width = format.width,
         height = format.height,
+        coding = ?coding,
         "ambient camera open"
     );
 
@@ -147,23 +256,142 @@ fn capture(
         if used == 0 {
             continue;
         }
-        let Some(jpeg) = buffer.get(..used) else {
+        let Some(bytes) = buffer.get(..used) else {
             continue;
         };
 
-        match decode(jpeg) {
-            Ok((width, height, rgb)) => {
-                let frame = Arc::new(Frame {
-                    width,
-                    height,
-                    rgb,
-                    jpeg: jpeg.to_vec(),
-                });
+        match frame_from(bytes, coding, format.width, format.height) {
+            Ok(frame) => {
                 // A closed receiver just means nobody is watching; the camera
                 // keeps running so that a page opened later has frames at once.
-                let _ = frames.send(Some(frame));
+                let _ = frames.send(Some(Arc::new(frame)));
             }
             Err(err) => warn!(%err, "dropping a frame that would not decode"),
         }
+    }
+}
+
+/// Pick the best coding the camera will actually give us.
+///
+/// Asking for a format is a negotiation, not a command: the driver is free to
+/// answer with something else. So each candidate is checked against what came
+/// back, and a camera that refuses both is told so by name.
+#[cfg(target_os = "linux")]
+fn choose_format(device: &v4l::device::Device) -> anyhow::Result<(v4l::format::Format, Coding)> {
+    use v4l::format::{Format, FourCC};
+    use v4l::video::Capture as _;
+
+    for (fourcc, coding) in [(MJPEG, Coding::Mjpeg), (YUYV, Coding::Yuyv)] {
+        let wanted = Format::new(
+            super::CAPTURE_WIDTH,
+            super::CAPTURE_HEIGHT,
+            FourCC::new(fourcc),
+        );
+
+        match device.set_format(&wanted) {
+            Ok(format) if format.fourcc == FourCC::new(fourcc) => return Ok((format, coding)),
+            Ok(format) => tracing::debug!(
+                got = ?format.fourcc,
+                asked = %String::from_utf8_lossy(fourcc),
+                "the camera refused this coding"
+            ),
+            Err(err) => tracing::debug!(
+                %err,
+                asked = %String::from_utf8_lossy(fourcc),
+                "could not ask for this coding"
+            ),
+        }
+    }
+
+    anyhow::bail!(
+        "this camera offers neither MJPEG nor YUYV at {}x{}; ambient capture needs one of them",
+        super::CAPTURE_WIDTH,
+        super::CAPTURE_HEIGHT
+    )
+}
+
+/// Turn one block of camera bytes into a frame the rest of the daemon can use.
+pub fn frame_from(bytes: &[u8], coding: Coding, width: u32, height: u32) -> anyhow::Result<Frame> {
+    match coding {
+        Coding::Mjpeg => {
+            let (width, height, rgb) = decode_mjpeg(bytes)?;
+            Ok(Frame {
+                width,
+                height,
+                rgb,
+                preview: bytes.to_vec(),
+                preview_type: TYPE_JPEG,
+            })
+        }
+        Coding::Yuyv => {
+            let rgb = yuyv_to_rgb(bytes, width, height)?;
+            let (preview_width, preview_height, small) = halve(&rgb, width, height);
+            Ok(Frame {
+                width,
+                height,
+                rgb,
+                preview: bmp(&small, preview_width, preview_height),
+                preview_type: TYPE_BMP,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_neutral_yuyv_frame_comes_back_grey() {
+        // Y=128 with neutral chroma is mid grey in every colour model.
+        let rgb = yuyv_to_rgb(&[128, 128, 128, 128, 128, 128, 128, 128], 2, 2).unwrap();
+        assert_eq!(rgb, [128_u8; 12]);
+    }
+
+    #[test]
+    fn yuyv_chroma_is_applied_to_both_pixels_it_covers() {
+        // V above centre pushes red up; both pixels share that chroma pair.
+        let frame = [200, 128, 200, 200, 200, 128, 200, 200];
+        let rgb = yuyv_to_rgb(&frame, 2, 2).unwrap();
+        let first = &rgb[0..3];
+        let second = &rgb[3..6];
+        assert_eq!(first, second, "one chroma pair, one colour");
+        assert!(first[0] > first[1] && first[0] > first[2], "got {first:?}");
+    }
+
+    #[test]
+    fn a_short_yuyv_frame_is_refused_rather_than_read_past_the_end() {
+        assert!(yuyv_to_rgb(&[0, 0, 0], 640, 480).is_err());
+    }
+
+    #[test]
+    fn a_bmp_has_the_header_everyone_expects() {
+        let image = vec![10, 20, 30, 40, 50, 60];
+        let bmp = bmp(&image, 2, 1);
+
+        assert_eq!(&bmp[0..2], b"BM");
+        assert_eq!(bmp[18..22], 2_u32.to_le_bytes(), "width");
+        assert_eq!(bmp[22..26], 1_u32.to_le_bytes(), "height");
+        assert_eq!(bmp[28..30], 24_u16.to_le_bytes(), "bits per pixel");
+        // Bottom-up and BGR: the one row is both pixels with the channels swapped.
+        assert_eq!(&bmp[54..60], &[30, 20, 10, 60, 50, 40]);
+    }
+
+    #[test]
+    fn halving_keeps_the_top_left_of_each_pair() {
+        let mut image = Vec::new();
+        for _ in 0..2 {
+            for x in 0..4 {
+                image.extend_from_slice(if x % 2 == 0 {
+                    &[255, 0, 0]
+                } else {
+                    &[0, 255, 0]
+                });
+            }
+        }
+
+        let (width, height, small) = halve(&image, 4, 2);
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(small, vec![255, 0, 0, 255, 0, 0]);
     }
 }

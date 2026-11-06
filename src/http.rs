@@ -181,7 +181,6 @@ input[type=range]{width:8rem}
 </section>
 <section class="card"><h2>Parameters</h2>
 <div class="row">
-<label>Aspect <input id="aspect" type="number" step="0.01" min="0.5" max="4" value="1.7778" style="width:6rem"></label>
 <label>Depth <input id="depth" type="range" min="3" max="30" value="10"><span id="depthv">10%</span></label>
 <label><input id="linear" type="checkbox" checked> Linear light</label>
 <button id="save" class="primary">Save calibration</button>
@@ -403,10 +402,6 @@ view.addEventListener('contextmenu', (event) => {
   draw();
 });
 
-document.getElementById('aspect').addEventListener('change', (event) => {
-  const value = parseFloat(event.target.value);
-  if (value > 0.4 && value < 5) aspect = value;
-});
 document.getElementById('depth').addEventListener('input', (event) => {
   depth = parseInt(event.target.value, 10) / 100;
   document.getElementById('depthv').textContent = event.target.value + '%';
@@ -427,7 +422,6 @@ async function loadSaved() {
     aspect = saved.aspect;
     depth = saved.depth;
     linear = saved.linear;
-    document.getElementById('aspect').value = aspect.toFixed(4);
     const percent = Math.round(depth * 100);
     document.getElementById('depth').value = String(percent);
     document.getElementById('depthv').textContent = percent + '%';
@@ -516,32 +510,45 @@ async fn preview(State(state): State<AppState>) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let stream = futures::stream::unfold(ambient.frames(), |mut frames| async move {
-        loop {
-            if frames.changed().await.is_err() {
-                return None;
-            }
-            let frame = {
-                let borrowed = frames.borrow_and_update();
-                (*borrowed).clone()
-            };
-            let Some(frame) = frame else {
-                continue;
-            };
+    // Holding this guard is what tells the rest of the daemon that somebody is
+    // looking. The strip follows the camera for exactly as long as the stream is
+    // open, and goes back to what it was doing when the stream is dropped — which
+    // happens even if the browser disappears without closing cleanly.
+    let guard = ambient.begin_viewing();
 
-            let mut part = Vec::with_capacity(frame.jpeg.len() + 96);
-            part.extend_from_slice(
-                format!(
-                    "--{PREVIEW_BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
-                    frame.jpeg.len()
-                )
-                .as_bytes(),
-            );
-            part.extend_from_slice(&frame.jpeg);
-            part.extend_from_slice(b"\r\n");
-            return Some((Ok::<Bytes, std::io::Error>(Bytes::from(part)), frames));
-        }
-    });
+    let stream = futures::stream::unfold(
+        (ambient.frames(), guard),
+        |(mut frames, guard)| async move {
+            loop {
+                if frames.changed().await.is_err() {
+                    return None;
+                }
+                let frame = {
+                    let borrowed = frames.borrow_and_update();
+                    (*borrowed).clone()
+                };
+                let Some(frame) = frame else {
+                    continue;
+                };
+
+                let mut part = Vec::with_capacity(frame.preview.len() + 96);
+                part.extend_from_slice(
+                    format!(
+                        "--{PREVIEW_BOUNDARY}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
+                        frame.preview_type,
+                        frame.preview.len()
+                    )
+                    .as_bytes(),
+                );
+                part.extend_from_slice(&frame.preview);
+                part.extend_from_slice(b"\r\n");
+                return Some((
+                    Ok::<Bytes, std::io::Error>(Bytes::from(part)),
+                    (frames, guard),
+                ));
+            }
+        },
+    );
 
     match Response::builder()
         .header(

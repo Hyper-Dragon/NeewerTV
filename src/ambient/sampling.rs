@@ -38,8 +38,11 @@ pub struct Frame {
     pub height: u32,
     /// Three bytes per pixel, row-major, no padding.
     pub rgb: Vec<u8>,
-    /// The frame as the camera produced it.
-    pub jpeg: Vec<u8>,
+    /// Ready to send to the browser: the camera's own JPEG when it gives us
+    /// MJPEG, a BMP this daemon assembled when it does not.
+    pub preview: Vec<u8>,
+    /// Content type matching `preview`.
+    pub preview_type: &'static str,
 }
 
 impl Frame {
@@ -340,7 +343,8 @@ mod tests {
             width: SIZE,
             height: SIZE,
             rgb,
-            jpeg: Vec::new(),
+            preview: Vec::new(),
+            preview_type: crate::ambient::camera::TYPE_JPEG,
         }
     }
 

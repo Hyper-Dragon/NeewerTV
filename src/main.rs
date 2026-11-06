@@ -41,14 +41,108 @@ fn build_version() -> String {
     }
 }
 
-/// Whether ambient capture has anything to do.
-///
+/// Whether ambient capture has anything to do.///
 /// Two independent reasons to run: the calibration screen is being served, or a
 /// calibration has already been saved and the sampler should use it. The second
 /// is what lets the operator calibrate once and then drop back to `observe` or
 /// `off` without turning the feature off.
 fn ambient_enabled(config: &Config) -> bool {
     config.web.permits_calibration() || config.ambient.calibration.exists()
+}
+
+/// Follow the camera for as long as somebody is looking at the calibration page.
+///
+/// Nothing here decides *what* the strip should be doing; it only reports what the
+/// camera sees while the page is open, and tells the worker when the page opens
+/// and closes. The worker owns the restoring, because it is the only thing that
+/// knows what the strip was doing before.
+fn spawn_ambient_bridge(
+    ambient: neewertv::ambient::Handle,
+    commands: mpsc::Sender<Message>,
+    snapshot: watch::Receiver<Snapshot>,
+) {
+    tokio::spawn(async move {
+        let mut watching = ambient.watching();
+        let mut latest = ambient.latest_changes();
+        let mut previewing = false;
+
+        loop {
+            tokio::select! {
+                changed = watching.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                changed = latest.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            // Taking the strip over before there is anything to put on it would
+            // switch the light on and show nothing, so the preview waits for the
+            // first calibrated reading — which is what happens when the operator
+            // saves a calibration from the page they already have open.
+            let ready = *watching.borrow_and_update()
+                && latest
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|reading| reading.calibrated);
+
+            if ready != previewing {
+                previewing = ready;
+                let message = if ready {
+                    Message::AmbientStart
+                } else {
+                    Message::AmbientStop
+                };
+                if commands.send(message).await.is_err() {
+                    break;
+                }
+            }
+
+            if !ready {
+                continue;
+            }
+
+            let Some(reading) = latest.borrow_and_update().clone() else {
+                continue;
+            };
+            if !reading.calibrated {
+                continue;
+            }
+
+            // The user's brightness is a scale, not something the preview takes
+            // over: twenty segments at full blast in a dark room is not what the
+            // slider is for.
+            let brightness = snapshot
+                .borrow()
+                .brightness
+                .map_or(1000, |level| (u32::from(level) * 1000 + 127) / 255)
+                as u16;
+
+            let entries = reading
+                .colours
+                .iter()
+                .map(|[red, green, blue]| {
+                    let hsi = neewertv::protocol::hsi::rgb_to_hsi(*red, *green, *blue);
+                    (hsi.lightness, hsi.hue, hsi.saturation)
+                })
+                .collect::<Vec<_>>();
+
+            if commands
+                .send(Message::Ambient {
+                    entries,
+                    brightness,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 }
 
 /// The flag the container's `HEALTHCHECK` invokes.
@@ -207,6 +301,7 @@ async fn run() -> anyhow::Result<()> {
         neewertv::ambient::start(
             config.ambient.camera.clone(),
             config.ambient.calibration.clone(),
+            config.ambient.max_fps,
             shutdown.clone(),
         )
     });
@@ -214,6 +309,13 @@ async fn run() -> anyhow::Result<()> {
     // The worker owns the link; everything else holds a handle.
     let (command_tx, command_rx) = mpsc::channel::<Message>(32);
     let (snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
+
+    // While somebody has the calibration page open the strip follows the camera,
+    // and nothing else. The preview stream is the lease, so leaving the page is
+    // what puts the strip back.
+    if let Some(handle) = &ambient {
+        spawn_ambient_bridge(handle.clone(), command_tx.clone(), snapshot_rx.clone());
+    }
 
     let link = BluetoothLink::new(
         config.ble.name_match.clone(),

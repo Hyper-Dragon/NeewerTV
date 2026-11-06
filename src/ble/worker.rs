@@ -87,6 +87,19 @@ pub enum Message {
     Tick(u64),
     /// Stop any alert, optionally restoring first.
     Cancel { replay: bool },
+    /// Somebody opened the calibration page: follow the camera, and remember what
+    /// to put back when they leave.
+    AmbientStart,
+    /// Twenty segment colours from the camera.
+    ///
+    /// Dropped when no preview is running, so a page left open in one tab cannot
+    /// keep overwriting a command sent from another.
+    Ambient {
+        entries: Vec<(u8, u16, u8)>,
+        brightness: u16,
+    },
+    /// The calibration page was closed: put the strip back.
+    AmbientStop,
     /// Release the link and stop. Sent on shutdown, and the reason the process
     /// waits for this task instead of exiting underneath it.
     Shutdown,
@@ -171,6 +184,20 @@ pub struct Worker<L: Link> {
     keepalive_ms: u64,
     /// When the link last carried anything, keep-alive included.
     last_traffic: u64,
+    /// The ambient preview in progress, and what to put back when it ends.
+    ambient: Option<AmbientPreview>,
+}
+
+/// A preview being driven from the calibration page.
+///
+/// It borrows the machinery an alert already uses: capture what the strip looks
+/// like *before* taking it over, in both of the states it may be in, and replay
+/// the right one when the takeover ends.
+struct AmbientPreview {
+    restore: Restore,
+    /// Whether the strip was lit when the preview began, which decides which of
+    /// the two restores is the right one.
+    was_on: bool,
 }
 
 /// Why an attach or a write failed, carrying the decision it earned.
@@ -208,6 +235,7 @@ impl<L: Link> Worker<L> {
             up_since: 0,
             keepalive_ms: 0,
             last_traffic: 0,
+            ambient: None,
         }
     }
 
@@ -235,6 +263,10 @@ impl<L: Link> Worker<L> {
             match message {
                 Message::Batch(batch) => {
                     self.snapshot.commands_received += 1;
+                    // A command from the user outranks a preview. Ending it here
+                    // means the next camera frame is dropped rather than
+                    // overwriting what they just asked for a frame later.
+                    self.ambient = None;
                     self.queue.push(batch);
 
                     // Absorb whatever else is already waiting, so a slider drag
@@ -372,6 +404,69 @@ impl<L: Link> Worker<L> {
                     // the adoption below refuses to overwrite a command.
                     if self.link.is_up().await && !self.state_queried {
                         self.read_device_state().await;
+                    }
+                }
+
+                Message::AmbientStart => {
+                    if self.ambient.is_none() {
+                        let was_on = self.snapshot.on;
+                        self.ambient = Some(AmbientPreview {
+                            // Captured before anything is written: this is the
+                            // only record of what the strip was doing.
+                            restore: self.restore_points(),
+                            was_on,
+                        });
+
+                        // A preview that drives a dark strip is indistinguishable
+                        // from a sampler that has stopped, so wake it the way an
+                        // alert does — and put it back to sleep on the way out.
+                        if !was_on {
+                            match self.write_all(&[wire::power(true)]).await {
+                                Ok(()) => self.snapshot.on = true,
+                                Err(failure) => {
+                                    self.snapshot.last_error = Some(failure.error.to_string());
+                                }
+                            }
+                        }
+                        tracing::info!("ambient preview started");
+                    }
+                }
+
+                Message::Ambient {
+                    entries,
+                    brightness,
+                } => {
+                    // No preview running means the page was closed mid-flight, or
+                    // a user command ended it. Either way this frame is stale.
+                    if self.ambient.is_some() {
+                        match command::frames(&Command::Segments {
+                            entries,
+                            brightness,
+                        }) {
+                            Ok(frames) => {
+                                if let Err(failure) = self.write_all(&frames).await {
+                                    self.snapshot.last_error = Some(failure.error.to_string());
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!(%err, "ambient frame could not be encoded")
+                            }
+                        }
+                    }
+                }
+
+                Message::AmbientStop => {
+                    if let Some(preview) = self.ambient.take() {
+                        let frames = if preview.was_on {
+                            preview.restore.lit
+                        } else {
+                            preview.restore.dark
+                        };
+                        if let Err(failure) = self.write_all(&frames).await {
+                            self.snapshot.last_error = Some(failure.error.to_string());
+                        }
+                        self.snapshot.on = preview.was_on;
+                        tracing::info!("ambient preview stopped; strip restored");
                     }
                 }
 

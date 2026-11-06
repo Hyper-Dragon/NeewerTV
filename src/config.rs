@@ -157,6 +157,8 @@ pub struct AmbientConfig {
     pub camera: PathBuf,
     /// JSON file holding the corners, aspect and depth. On a volume.
     pub calibration: PathBuf,
+    /// Upper bound on samples per second, zero for no bound.
+    pub max_fps: u8,
 }
 
 /// Every environment variable the daemon reads.
@@ -181,6 +183,7 @@ pub mod env {
     pub const DEVICE_NAME: &str = "DEVICE_NAME";
     pub const AMBIENT_CAMERA: &str = "AMBIENT_CAMERA";
     pub const AMBIENT_CALIBRATION: &str = "AMBIENT_CALIBRATION";
+    pub const AMBIENT_MAX_FPS: &str = "AMBIENT_MAX_FPS";
     pub const WEB_INTERFACE: &str = "WEB_INTERFACE";
     pub const WEB_BIND: &str = "WEB_BIND";
     pub const LOG_LEVEL: &str = "LOG_LEVEL";
@@ -236,6 +239,10 @@ pub mod default {
     /// and this file has to outlive the container: re-clicking four corners after
     /// every update would defeat the point of a fixed camera.
     pub const AMBIENT_CALIBRATION: &str = "/data/ambient-calibration.json";
+    /// Half of what most cameras offer, and more than the bluetooth link can
+    /// carry. It exists to bound the work on a small box with an eager camera,
+    /// not because the sampler is slow; zero means no cap at all.
+    pub const AMBIENT_MAX_FPS: u8 = 15;
 }
 
 /// Which alert colours to publish as buttons, and how long they last.
@@ -330,6 +337,8 @@ impl Config {
                 get(env::AMBIENT_CALIBRATION)
                     .unwrap_or_else(|| default::AMBIENT_CALIBRATION.to_owned()),
             ),
+            max_fps: parse_or(&get, env::AMBIENT_MAX_FPS, default::AMBIENT_MAX_FPS)?
+                .min(MAX_AMBIENT_FPS),
         };
 
         Ok(Self {
@@ -350,6 +359,10 @@ impl Config {
         })
     }
 }
+
+/// The highest sample rate anybody can sensibly ask for: the camera will not go
+/// above sixty and neither should the setting.
+const MAX_AMBIENT_FPS: u8 = 60;
 
 /// Turn `ALERT_BUTTONS` into colours, rejecting names that do not exist.
 ///
@@ -618,6 +631,7 @@ mod tests {
             parsed.ambient.calibration,
             PathBuf::from("/data/ambient-calibration.json")
         );
+        assert_eq!(parsed.ambient.max_fps, 15);
     }
 
     #[test]
