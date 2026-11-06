@@ -11,9 +11,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::geometry::Homography;
+use super::render::Render;
 use super::{
     ASPECT_MAX, ASPECT_MIN, CALIBRATION_VERSION, CORNERS, DEFAULT_ASPECT, DEFAULT_DEPTH, DEPTH_MAX,
-    DEPTH_MIN, FRAME_MAX,
+    DEPTH_MIN, FRAME_MAX, SEGMENTS,
 };
 
 /// The size of the captured frame the corners were measured against.
@@ -57,6 +58,21 @@ pub struct Calibration {
     /// swapped corners still produce a valid homography and a plausible picture,
     /// just one mirrored or rotated relative to the LEDs.
     pub corners: [[f32; 2]; CORNERS],
+    /// How a reading is pushed towards what the firmware renders well.
+    #[serde(default)]
+    pub render: Render,
+    /// Measured black field, per zone per channel, in linear light.
+    ///
+    /// Tier 1's first half. Ambient light reflected off the screen is most of
+    /// what makes a black scene glow.
+    #[serde(default)]
+    pub black: Option<[[f32; 3]; SEGMENTS]>,
+    /// Measured white field, per zone per channel, in linear light.
+    ///
+    /// Tier 1's second half: lens vignetting and the camera's own colour cast,
+    /// both of which show up as a strip that is brighter in the middle.
+    #[serde(default)]
+    pub white: Option<[[f32; 3]; SEGMENTS]>,
 }
 
 fn default_aspect() -> f32 {
@@ -86,6 +102,10 @@ pub enum CalibrationError {
     Corner { index: usize, x: f32, y: f32 },
     #[error("the corners are degenerate: three of them lie on one line")]
     Degenerate,
+    #[error("the render settings are outside their ranges")]
+    Render,
+    #[error("the {field} field has an unusable value at zone {zone}")]
+    Field { field: &'static str, zone: usize },
 }
 
 impl Calibration {
@@ -117,7 +137,30 @@ impl Calibration {
         if self.homography().is_none() {
             return Err(CalibrationError::Degenerate);
         }
+        if !self.render.is_sane() {
+            return Err(CalibrationError::Render);
+        }
+        for (field, values) in [("black", &self.black), ("white", &self.white)] {
+            if let Some(values) = values {
+                for (zone, channels) in values.iter().enumerate() {
+                    if channels
+                        .iter()
+                        .any(|value| !value.is_finite() || *value < 0.0)
+                    {
+                        return Err(CalibrationError::Field { field, zone });
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The flat-field correction, when either half has been measured.
+    pub fn correction(&self) -> Option<super::sampling::Correction> {
+        if self.black.is_none() && self.white.is_none() {
+            return None;
+        }
+        super::sampling::Correction::from_fields(self.black.as_ref(), self.white.as_ref())
     }
 
     pub fn homography(&self) -> Option<Homography> {
@@ -132,8 +175,21 @@ impl Calibration {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read(path)
             .map_err(|err| anyhow::anyhow!("reading {}: {err}", path.display()))?;
-        let calibration: Self = serde_json::from_slice(&raw)
+        let mut calibration: Self = serde_json::from_slice(&raw)
             .map_err(|err| anyhow::anyhow!("parsing {}: {err}", path.display()))?;
+
+        // Older files are upgraded in place — version 1 simply has no flat field
+        // and no render tuning, and the serde defaults supply both. A file from
+        // the future is refused rather than quietly reinterpreted.
+        if calibration.version == 0 || calibration.version > CALIBRATION_VERSION {
+            return Err(anyhow::anyhow!(
+                "{} is version {}, and this build reads up to {CALIBRATION_VERSION}",
+                path.display(),
+                calibration.version
+            ));
+        }
+        calibration.version = CALIBRATION_VERSION;
+
         calibration
             .validate()
             .map_err(|err| anyhow::anyhow!("{} is not usable: {err}", path.display()))?;
@@ -186,7 +242,48 @@ mod tests {
             depth: DEFAULT_DEPTH,
             linear: true,
             corners: [[0.17, 0.15], [0.87, 0.10], [0.93, 0.90], [0.11, 0.87]],
+            render: Render::default(),
+            black: None,
+            white: None,
         }
+    }
+
+    #[test]
+    fn a_version_one_file_still_loads_and_is_upgraded() {
+        // The corners are the expensive part; losing them to a schema change
+        // would mean asking somebody to re-click four points on a ladder.
+        let directory = std::env::temp_dir().join(format!(
+            "neewertv-upgrade-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp directory");
+        let path = directory.join("calibration.json");
+
+        let mut old = serde_json::to_value(sample()).expect("serialisable");
+        let object = old.as_object_mut().expect("an object");
+        object.insert("version".to_owned(), serde_json::json!(1));
+        object.remove("render");
+        object.remove("black");
+        object.remove("white");
+        std::fs::write(&path, serde_json::to_vec(&old).expect("encoded")).expect("written");
+
+        let loaded = Calibration::load(&path).expect("a version one file is still readable");
+        assert_eq!(loaded.version, CALIBRATION_VERSION, "upgraded on read");
+        assert_eq!(loaded.render, Render::default(), "tuning filled in");
+        assert_eq!(loaded.corners, sample().corners, "corners survive");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_file_from_a_newer_build_is_refused_rather_than_reinterpreted() {
+        let mut newer = sample();
+        newer.version = CALIBRATION_VERSION + 1;
+        assert!(matches!(
+            newer.validate(),
+            Err(CalibrationError::Version { .. })
+        ));
     }
 
     #[test]
@@ -228,7 +325,18 @@ mod tests {
 
     #[test]
     fn json_round_trips_through_a_real_file() {
-        let calibration = sample();
+        // Everything the operator measured or tuned has to survive the trip: a
+        // flat field costs a trip up a ladder to redo if it is silently dropped.
+        let mut calibration = sample();
+        calibration.render = Render {
+            black_level: 23,
+            saturation_gain: 2.5,
+            lightness_gain: 1.7,
+            lightness_floor: 11,
+        };
+        calibration.black = Some([[0.02, 0.03, 0.04]; SEGMENTS]);
+        calibration.white = Some([[0.9, 0.85, 0.8]; SEGMENTS]);
+
         let directory = std::env::temp_dir().join(format!(
             "neewertv-calibration-{}-{:?}",
             std::process::id(),
@@ -239,10 +347,32 @@ mod tests {
         calibration.save(&path).expect("saving is writable");
         let loaded = Calibration::load(&path).expect("what was saved can be read");
         assert_eq!(loaded, calibration);
+        assert_eq!(loaded.render, calibration.render, "tuning survives");
+        assert_eq!(loaded.white, calibration.white, "white field survives");
+        assert_eq!(loaded.black, calibration.black, "black field survives");
 
         // And the temporary file is not left behind for the next start to trip over.
         assert!(!path.with_extension("json.tmp").exists());
 
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn either_flat_field_is_usable_on_its_own() {
+        let mut calibration = sample();
+        assert!(calibration.correction().is_none(), "nothing measured yet");
+
+        calibration.white = Some([[0.8; 3]; SEGMENTS]);
+        assert!(
+            calibration.correction().is_some(),
+            "a white field alone already flattens the camera's shading"
+        );
+
+        calibration.white = None;
+        calibration.black = Some([[0.01; 3]; SEGMENTS]);
+        assert!(
+            calibration.correction().is_some(),
+            "a black field alone already removes the floor"
+        );
     }
 }

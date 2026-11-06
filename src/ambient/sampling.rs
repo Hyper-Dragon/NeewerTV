@@ -125,6 +125,7 @@ pub struct Sampler {
     homography: Homography,
     aspect: f32,
     linear: bool,
+    correction: Option<Correction>,
     smoothed: [[f32; 3]; SEGMENTS],
     primed: bool,
 }
@@ -137,9 +138,29 @@ impl Sampler {
             homography: calibration.homography()?,
             aspect: calibration.aspect,
             linear: calibration.linear,
+            correction: calibration.correction(),
             smoothed: [[0.0; 3]; SEGMENTS],
             primed: false,
         })
+    }
+
+    /// Measure every zone as it is, for flat-field calibration.
+    ///
+    /// Deliberately ignores the sampler's own correction: a field measured through
+    /// the last correction could never replace it.
+    pub fn measure(&self, frame: &Frame) -> Measurement {
+        let mut measurement = Measurement {
+            linear: [[0.0; 3]; SEGMENTS],
+            clipped: [0.0; SEGMENTS],
+        };
+
+        for (index, zone) in self.zones.iter().copied().enumerate() {
+            let (linear, clipped) = measure_zone(frame, zone, self.aspect, &self.homography);
+            measurement.linear[index] = linear;
+            measurement.clipped[index] = clipped;
+        }
+
+        measurement
     }
 
     pub fn sample(&mut self, frame: &Frame) -> Reading {
@@ -147,8 +168,15 @@ impl Sampler {
         let mut clipped_zones = 0;
 
         for (index, zone) in self.zones.iter().copied().enumerate() {
-            let (raw, clipped) =
-                average_zone(frame, zone, self.aspect, &self.homography, self.linear);
+            let correction = self.correction.map(|correction| correction.zone(index));
+            let (raw, clipped) = average_zone(
+                frame,
+                zone,
+                self.aspect,
+                &self.homography,
+                self.linear,
+                correction,
+            );
 
             if clipped {
                 clipped_zones += 1;
@@ -190,6 +218,134 @@ fn project_outline(zone: Rect, aspect: f32, homography: &Homography) -> [[f32; 2
     outline
 }
 
+/// How bright each zone is when the screen is white, and how much of what it reads
+/// when the screen is black is the room rather than the screen.
+///
+/// Both halves are in linear light, per zone per channel. The gain is relative to
+/// the mean across zones, so applying it flattens the camera's own shading without
+/// changing the overall exposure.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Correction {
+    black: [[f32; 3]; SEGMENTS],
+    gain: [[f32; 3]; SEGMENTS],
+}
+
+/// One zone's slice of a [`Correction`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoneCorrection {
+    pub black: [f32; 3],
+    pub gain: [f32; 3],
+}
+
+/// A white field darker than this, in linear light, is not a white field.
+pub const MIN_MEASURED_WHITE: f32 = 0.01;
+/// Gains are clamped: a zone that measured almost nothing would otherwise get an
+/// enormous multiplier and turn sensor noise into a light show.
+const MIN_GAIN: f32 = 0.25;
+const MAX_GAIN: f32 = 4.0;
+
+impl Correction {
+    /// `None` when a white field is present but unusable — a zone that saw almost
+    /// nothing cannot be corrected, because the number it is divided by is noise.
+    ///
+    /// Either half may stand alone. A white field on its own flattens the camera's
+    /// shading; a black field on its own removes the floor the camera reports in
+    /// the dark. Measuring one is worth doing before the other.
+    pub fn from_fields(
+        black: Option<&[[f32; 3]; SEGMENTS]>,
+        white: Option<&[[f32; 3]; SEGMENTS]>,
+    ) -> Option<Self> {
+        let mut gain = [[1.0_f32; 3]; SEGMENTS];
+
+        if let Some(white) = white {
+            let mut mean = [0.0_f32; 3];
+            for zone in white {
+                for (channel, value) in zone.iter().enumerate() {
+                    mean[channel] += value;
+                }
+            }
+            for value in &mut mean {
+                *value /= SEGMENTS as f32;
+            }
+
+            for (index, zone) in white.iter().enumerate() {
+                for (channel, value) in zone.iter().enumerate() {
+                    if *value <= MIN_MEASURED_WHITE {
+                        return None;
+                    }
+                    gain[index][channel] = (mean[channel] / value).clamp(MIN_GAIN, MAX_GAIN);
+                }
+            }
+        }
+
+        Some(Self {
+            black: black.copied().unwrap_or([[0.0; 3]; SEGMENTS]),
+            gain,
+        })
+    }
+
+    pub fn zone(&self, index: usize) -> ZoneCorrection {
+        ZoneCorrection {
+            black: self.black[index],
+            gain: self.gain[index],
+        }
+    }
+
+    /// How far apart the zones measured, as a fraction of the mean — 0.2 means
+    /// the brightest zone read twenty percent above the average.
+    pub fn spread(&self) -> f32 {
+        let mut lowest = f32::MAX;
+        let mut highest = 0.0_f32;
+        for zone in &self.gain {
+            for value in zone {
+                lowest = lowest.min(*value);
+                highest = highest.max(*value);
+            }
+        }
+        if highest <= 0.0 {
+            0.0
+        } else {
+            1.0 - lowest / highest
+        }
+    }
+}
+
+/// Raw per-zone numbers from one frame, before any correction or smoothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Measurement {
+    /// Mean linear light per zone per channel.
+    pub linear: [[f32; 3]; SEGMENTS],
+    /// Fraction of each zone's samples that hit the clip level. A white field
+    /// with any of this is unusable: the value it would divide by is unknown.
+    pub clipped: [f32; SEGMENTS],
+}
+
+impl Measurement {
+    /// The worst clipping any zone saw.
+    pub fn worst_clip(&self) -> f32 {
+        self.clipped.iter().copied().fold(0.0, f32::max)
+    }
+
+    /// The brightest thing any zone saw, for telling an empty screen from a lit one.
+    pub fn brightest(&self) -> f32 {
+        self.linear
+            .iter()
+            .flat_map(|zone| zone.iter())
+            .copied()
+            .fold(0.0, f32::max)
+    }
+}
+
+/// Everything one zone's samples added up to.
+struct Totals {
+    all_linear: [f32; 3],
+    all_encoded: [f32; 3],
+    clean_linear: [f32; 3],
+    clean_encoded: [f32; 3],
+    total: usize,
+    clean: usize,
+}
+
 /// Average one zone, in linear light unless told otherwise.
 ///
 /// Returns the colour and whether the zone is over-exposed.
@@ -199,14 +355,101 @@ pub fn average_zone(
     aspect: f32,
     homography: &Homography,
     linear: bool,
+    correction: Option<ZoneCorrection>,
 ) -> ([f32; 3], bool) {
-    if !zone.is_usable() {
+    let totals = collect(frame, zone, aspect, homography, correction);
+    if totals.total == 0 {
         return ([0.0; 3], false);
+    }
+
+    // Drop the clipped samples only while they are a small minority. A zone that
+    // is genuinely bright has to keep its energy, otherwise it reads as its own
+    // dark parts — a half-black, half-white zone averages to black.
+    let threshold = ((totals.total as f32) * CLEAN_SAMPLE_FRACTION).ceil() as usize;
+    let use_clean = totals.clean >= CLEAN_SAMPLE_MINIMUM.max(threshold);
+    let divisor = if use_clean {
+        totals.clean
+    } else {
+        totals.total
+    } as f32;
+
+    // A correction only exists in linear light, so asking for one implies it.
+    let linear = linear || correction.is_some();
+
+    let mut rgb = [0.0_f32; 3];
+    for (channel, slot) in rgb.iter_mut().enumerate() {
+        let encoded_sum = if use_clean {
+            totals.clean_encoded
+        } else {
+            totals.all_encoded
+        }[channel];
+        let linear_sum = if use_clean {
+            totals.clean_linear
+        } else {
+            totals.all_linear
+        }[channel];
+        *slot = if linear {
+            to_srgb(linear_sum / divisor).into()
+        } else {
+            (encoded_sum / divisor).round().clamp(0.0, 255.0)
+        };
+    }
+
+    let clipped_fraction = 1.0 - totals.clean as f32 / totals.total as f32;
+    (rgb, clipped_fraction > CLIP_SAMPLE_FRACTION)
+}
+
+/// Measure one zone exactly as it is: mean linear light, and how much of it was
+/// clipped.
+///
+/// No correction, no clip rejection, no smoothing — a flat field is being
+/// measured, and every one of those would answer a different question.
+pub fn measure_zone(
+    frame: &Frame,
+    zone: Rect,
+    aspect: f32,
+    homography: &Homography,
+) -> ([f32; 3], f32) {
+    let totals = collect(frame, zone, aspect, homography, None);
+    if totals.total == 0 {
+        return ([0.0; 3], 0.0);
+    }
+
+    let count = totals.total as f32;
+    let clipped = 1.0 - totals.clean as f32 / count;
+    (
+        [
+            totals.all_linear[0] / count,
+            totals.all_linear[1] / count,
+            totals.all_linear[2] / count,
+        ],
+        clipped,
+    )
+}
+
+/// Walk one zone's sample grid.
+fn collect(
+    frame: &Frame,
+    zone: Rect,
+    aspect: f32,
+    homography: &Homography,
+    correction: Option<ZoneCorrection>,
+) -> Totals {
+    let mut totals = Totals {
+        all_linear: [0.0; 3],
+        all_encoded: [0.0; 3],
+        clean_linear: [0.0; 3],
+        clean_encoded: [0.0; 3],
+        total: 0,
+        clean: 0,
+    };
+    if !zone.is_usable() {
+        return totals;
     }
 
     let projected = project_outline(zone, aspect, homography);
     if projected.iter().any(|point| !point[0].is_finite()) {
-        return ([0.0; 3], false);
+        return totals;
     }
 
     let width = frame.width as f32;
@@ -215,13 +458,6 @@ pub fn average_zone(
     let pixels_down = distance(projected[0], projected[3], width, height);
     let nx = samples_along(pixels_across);
     let ny = samples_along(pixels_down);
-
-    let mut all_linear = [0.0_f32; 3];
-    let mut all_encoded = [0.0_f32; 3];
-    let mut clean_linear = [0.0_f32; 3];
-    let mut clean_encoded = [0.0_f32; 3];
-    let mut total = 0_usize;
-    let mut clean = 0_usize;
 
     for i in 0..nx {
         let fx = INSET_X + INSET_WIDTH * (i as f32 / (nx - 1) as f32);
@@ -244,59 +480,44 @@ pub fn average_zone(
             }
 
             let pixel = frame.pixel(x as u32, y as u32);
-            let linear_pixel = [
+            let mut linear_pixel = [
                 TO_LINEAR[pixel[0] as usize],
                 TO_LINEAR[pixel[1] as usize],
                 TO_LINEAR[pixel[2] as usize],
             ];
 
-            for channel in 0..3 {
-                all_linear[channel] += linear_pixel[channel];
-                all_encoded[channel] += f32::from(pixel[channel]);
+            // The flat-field correction is affine with a clamp, so it has to be
+            // applied per sample rather than to the average. The clip test below
+            // deliberately still looks at the raw byte: a saturated sensor is
+            // saturated whatever is done with it afterwards.
+            if let Some(correction) = correction {
+                for (channel, value) in linear_pixel.iter_mut().enumerate() {
+                    *value = ((*value - correction.black[channel]).max(0.0)
+                        * correction.gain[channel])
+                        .clamp(0.0, 1.0);
+                }
             }
-            total += 1;
+
+            for (channel, value) in linear_pixel.iter().enumerate() {
+                totals.all_linear[channel] += value;
+                totals.all_encoded[channel] += f32::from(pixel[channel]);
+            }
+            totals.total += 1;
 
             // A channel at or above the clip level has no usable hue: its true
             // value is unknown, so the ratio between channels is wrong.
             if pixel.iter().any(|&value| value >= CLIP_LEVEL) {
                 continue;
             }
-            for channel in 0..3 {
-                clean_linear[channel] += linear_pixel[channel];
-                clean_encoded[channel] += f32::from(pixel[channel]);
+            for (channel, value) in linear_pixel.iter().enumerate() {
+                totals.clean_linear[channel] += value;
+                totals.clean_encoded[channel] += f32::from(pixel[channel]);
             }
-            clean += 1;
+            totals.clean += 1;
         }
     }
 
-    if total == 0 {
-        return ([0.0; 3], false);
-    }
-
-    // Drop the clipped samples only while they are a small minority. A zone that
-    // is genuinely bright has to keep its energy, otherwise it reads as its own
-    // dark parts — a half-black, half-white zone averages to black.
-    let threshold = ((total as f32) * CLEAN_SAMPLE_FRACTION).ceil() as usize;
-    let use_clean = clean >= CLEAN_SAMPLE_MINIMUM.max(threshold);
-    let divisor = if use_clean { clean } else { total } as f32;
-
-    let mut rgb = [0.0_f32; 3];
-    for (channel, slot) in rgb.iter_mut().enumerate() {
-        let encoded_sum = if use_clean {
-            clean_encoded
-        } else {
-            all_encoded
-        }[channel];
-        let linear_sum = if use_clean { clean_linear } else { all_linear }[channel];
-        *slot = if linear {
-            to_srgb(linear_sum / divisor).into()
-        } else {
-            (encoded_sum / divisor).round().clamp(0.0, 255.0)
-        };
-    }
-
-    let clipped_fraction = 1.0 - clean as f32 / total as f32;
-    (rgb, clipped_fraction > CLIP_SAMPLE_FRACTION)
+    totals
 }
 
 /// One sample per this many pixels on screen, clamped to a sane range.
@@ -355,7 +576,7 @@ mod tests {
     #[test]
     fn a_flat_grey_survives_the_linear_round_trip_exactly() {
         let frame = frame_with(|_, _| [128, 128, 128]);
-        let (rgb, clipped) = average_zone(&frame, whole_screen(), SQUARE, &identity(), true);
+        let (rgb, clipped) = average_zone(&frame, whole_screen(), SQUARE, &identity(), true, None);
         assert!(!clipped);
         for channel in rgb {
             assert!(
@@ -375,8 +596,8 @@ mod tests {
             }
         });
 
-        let (linear, _) = average_zone(&frame, whole_screen(), SQUARE, &identity(), true);
-        let (encoded, _) = average_zone(&frame, whole_screen(), SQUARE, &identity(), false);
+        let (linear, _) = average_zone(&frame, whole_screen(), SQUARE, &identity(), true, None);
+        let (encoded, _) = average_zone(&frame, whole_screen(), SQUARE, &identity(), false, None);
 
         // The physically correct answer for half black and half white is ~188;
         // averaging the encoded bytes instead lands near 126 and under-reports
@@ -401,7 +622,7 @@ mod tests {
             }
         });
 
-        let (rgb, clipped) = average_zone(&frame, whole_screen(), SQUARE, &identity(), true);
+        let (rgb, clipped) = average_zone(&frame, whole_screen(), SQUARE, &identity(), true, None);
         assert!(clipped, "an over-exposed zone must be reported");
         assert!(
             rgb[0] > 200.0,
@@ -415,5 +636,50 @@ mod tests {
         assert_eq!(samples_along(-5.0), SAMPLES_MIN);
         assert_eq!(samples_along(f32::NAN), SAMPLES_MIN);
         assert_eq!(samples_along(10_000.0), SAMPLES_MAX);
+    }
+
+    #[test]
+    fn a_white_field_on_its_own_flattens_the_zones() {
+        // The camera's own shading: one corner sees twice what its neighbour does.
+        let mut white = [[0.5_f32; 3]; SEGMENTS];
+        white[0] = [1.0; 3];
+
+        let correction =
+            Correction::from_fields(None, Some(&white)).expect("a white field is usable");
+
+        let apply = |value: f32, zone: ZoneCorrection| (value - zone.black[0]) * zone.gain[0];
+        let bright = apply(1.0, correction.zone(0));
+        let dim = apply(0.5, correction.zone(1));
+
+        assert!(
+            (bright - dim).abs() < 1e-5,
+            "both zones should land on the same value, got {bright} and {dim}"
+        );
+        assert_eq!(
+            correction.zone(0).black,
+            [0.0; 3],
+            "no black field measured, so no floor claimed"
+        );
+    }
+
+    #[test]
+    fn a_black_field_on_its_own_removes_the_floor_and_leaves_the_gain_alone() {
+        let mut black = [[0.02_f32; 3]; SEGMENTS];
+        black[6] = [0.2; 3];
+
+        let correction =
+            Correction::from_fields(Some(&black), None).expect("a black field is usable");
+        let zone = correction.zone(6);
+
+        assert_eq!(zone.gain, [1.0; 3], "there is nothing to flatten");
+        assert!((zone.black[0] - 0.2).abs() < 1e-6, "the floor is the floor");
+    }
+
+    #[test]
+    fn a_white_field_that_measured_nothing_is_refused() {
+        // Dividing by a number that is sensor noise would turn the strip into a
+        // light show, so an unusable white field has to be refused outright.
+        let dark = [[0.0_f32; 3]; SEGMENTS];
+        assert!(Correction::from_fields(None, Some(&dark)).is_none());
     }
 }

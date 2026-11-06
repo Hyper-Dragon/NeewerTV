@@ -18,13 +18,14 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use crate::ambient;
+use crate::ambient::sampling;
 use crate::ble::worker::Snapshot;
 use crate::config::WebMode;
 use crate::logs::LogBuffer;
@@ -43,6 +44,8 @@ pub const PATH_PREVIEW: &str = "/preview";
 pub const PATH_AMBIENT: &str = "/api/ambient";
 /// The stored calibration, read and written.
 pub const PATH_CALIBRATION: &str = "/api/calibration";
+/// Measure the white or black field that is on screen right now.
+pub const PATH_CALIBRATION_FIELD: &str = "/api/calibration/field";
 
 /// Boundary between the parts of the preview stream.
 const PREVIEW_BOUNDARY: &str = "neewertv-frame";
@@ -120,7 +123,8 @@ pub fn router(state: AppState) -> Router {
             .route(
                 PATH_CALIBRATION,
                 get(api_calibration).post(api_calibration_save),
-            );
+            )
+            .route(PATH_CALIBRATION_FIELD, post(api_calibration_field));
     }
 
     router.with_state(state)
@@ -186,10 +190,27 @@ input[type=range]{width:8rem}
 <button id="save" class="primary">Save calibration</button>
 <button id="png">Save PNG</button>
 </div>
+<div class="row">
+<label>Black level <input id="blacklevel" type="number" min="0" max="64" step="1" value="10"></label>
+<label>Colour gain <input id="satgain" type="number" min="1" max="8" step="0.1" value="2"></label>
+<label>Light gain <input id="lightgain" type="number" min="1" max="8" step="0.1" value="1.4"></label>
+</div>
 <p class="hint">Click the four corners of the screen in order: top-left, top-right,
 bottom-right, bottom-left. Drag a handle to adjust it; right-click removes the last
-corner. The colours below are what the twenty segments will be sent &mdash; nothing is
-sent yet.</p>
+corner. The swatches below are drawn from the same numbers the twenty segments are
+sent, so the gains above show up there as you change them.</p>
+</section>
+<section class="card"><h2>Flat field</h2>
+<div class="row">
+<span class="hint" id="fields">nothing measured</span>
+<button id="white">Measure white</button>
+<button id="black">Measure black</button>
+</div>
+<p class="hint">Fill the screen with the white field and measure: every zone sees the same
+colour, so whatever differs between them is the camera &mdash; lens shading, angle,
+distance, the light in the room. Do the same with the black field to find the floor the
+camera reports with nothing on screen. Either one can be measured on its own, and both
+are saved into the calibration.</p>
 </section>
 <section class="card"><h2>Segment colours</h2><div id="swatches" class="swatches"></div></section>
 </main>
@@ -207,6 +228,14 @@ let drag = -1;
 let aspect = 1.7778;
 let depth = 0.10;
 let linear = true;
+// Kept so the tuning can be sent back whole: the page does not edit the floor, but
+// dropping it would silently reset it to the default on every save.
+let render = { black_level: 10, saturation_gain: 2, lightness_gain: 1.4, lightness_floor: 8 };
+
+const numberFrom = (id, fallback) => {
+  const value = parseFloat(document.getElementById(id).value);
+  return Number.isFinite(value) ? value : fallback;
+};
 
 const pointAt = (event) => {
   const box = view.getBoundingClientRect();
@@ -304,10 +333,23 @@ function renderSwatches() {
   }
   latest.zones.forEach((zone, index) => {
     const cell = swatchBox.children[index];
-    const c = zone.colour;
-    cell.style.background = 'rgb(' + c.r + ',' + c.g + ',' + c.b + ')';
+    const c = zone.strip
+      ? hsvToRgb(zone.strip.hue, zone.strip.saturation, zone.strip.lightness)
+      : [zone.colour.r, zone.colour.g, zone.colour.b];
+    cell.style.background = 'rgb(' + c.join(',') + ')';
     cell.dataset.clipped = zone.clipped ? '1' : '0';
   });
+}
+
+// What the firmware does with the (hue, saturation, lightness) triple it is sent
+// is close enough to HSV for a preview, and it is the same triple, so the swatch
+// shows what the strip will do rather than what the camera saw.
+function hsvToRgb(hue, saturation, lightness) {
+  const channel = (n) => {
+    const k = (n + hue * 6) % 6;
+    return lightness - lightness * saturation * Math.max(0, Math.min(k, 4 - k, 1));
+  };
+  return [channel(5), channel(3), channel(1)].map((v) => Math.round(v * 255));
 }
 
 async function refresh() {
@@ -342,7 +384,18 @@ async function saveCalibration() {
   const res = await fetch('/api/calibration', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ aspect, depth, linear, corners: corners.map((c) => [c.x, c.y]) }),
+    body: JSON.stringify({
+      aspect,
+      depth,
+      linear,
+      corners: corners.map((c) => [c.x, c.y]),
+      render: {
+        black_level: numberFrom('blacklevel', render.black_level),
+        saturation_gain: numberFrom('satgain', render.saturation_gain),
+        lightness_gain: numberFrom('lightgain', render.lightness_gain),
+        lightness_floor: render.lightness_floor,
+      },
+    }),
   });
   if (res.ok) {
     statusLine.textContent = 'calibration saved';
@@ -350,6 +403,34 @@ async function saveCalibration() {
     const body = await res.json().catch(() => ({}));
     statusLine.textContent = 'not saved: ' + (body.error || res.status);
   }
+}
+
+function updateFields(white, black) {
+  const marks = [
+    white ? 'white \u2713' : 'white \u2014',
+    black ? 'black \u2713' : 'black \u2014',
+  ];
+  document.getElementById('fields').textContent = 'flat field: ' + marks.join(' \u00b7 ');
+}
+
+async function measureField(field) {
+  statusLine.textContent = 'measuring the ' + field + ' field\u2026';
+  const res = await fetch('/api/calibration/field', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ field }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    statusLine.textContent = body.error || ('measuring failed: ' + res.status);
+    return;
+  }
+  let line = field + ' field measured';
+  if (field === 'white' && typeof body.spread === 'number') {
+    line += ' \u00b7 zones differed by ' + Math.round(body.spread * 100) + '%';
+  }
+  statusLine.textContent = line;
+  loadSaved();
 }
 
 function savePng() {
@@ -412,6 +493,8 @@ document.getElementById('linear').addEventListener('change', (event) => {
 });
 document.getElementById('save').addEventListener('click', saveCalibration);
 document.getElementById('png').addEventListener('click', savePng);
+document.getElementById('white').addEventListener('click', () => measureField('white'));
+document.getElementById('black').addEventListener('click', () => measureField('black'));
 
 async function loadSaved() {
   try {
@@ -422,6 +505,11 @@ async function loadSaved() {
     aspect = saved.aspect;
     depth = saved.depth;
     linear = saved.linear;
+    if (saved.render) render = Object.assign(render, saved.render);
+    document.getElementById('blacklevel').value = String(render.black_level);
+    document.getElementById('satgain').value = String(render.saturation_gain);
+    document.getElementById('lightgain').value = String(render.lightness_gain);
+    updateFields(Boolean(saved.white), Boolean(saved.black));
     const percent = Math.round(depth * 100);
     document.getElementById('depth').value = String(percent);
     document.getElementById('depthv').textContent = percent + '%';
@@ -580,14 +668,27 @@ async fn api_ambient(State(state): State<AppState>) -> Response {
             .into_response();
     };
 
+    // The swatches show what the strip will be sent, not what the camera saw:
+    // they are the only way to see what the tuning is doing without walking over
+    // to the television. `strip` is the segment entry as (lightness, hue,
+    // saturation), normalised to 0–1 here so the page does not carry the wire
+    // scale.
+    let strip = ambient::render::entries(&latest.colours, latest.render);
     let zones: Vec<Value> = latest
         .outlines
         .iter()
         .zip(latest.colours.iter())
         .zip(latest.clipped.iter())
-        .map(|((outline, colour), clipped)| {
+        .zip(strip.iter())
+        .map(|(((outline, colour), clipped), entry)| {
+            let (lightness, hue, saturation) = *entry;
             json!({
                 "colour": { "r": colour[0], "g": colour[1], "b": colour[2] },
+                "strip": {
+                    "lightness": f32::from(lightness) / 100.0,
+                    "hue": f32::from(hue) / 255.0,
+                    "saturation": f32::from(saturation) / 100.0,
+                },
                 "clipped": clipped,
                 "outline": outline
                     .iter()
@@ -628,6 +729,15 @@ struct CalibrationRequest {
     #[serde(default)]
     linear: Option<bool>,
     corners: Vec<[f32; 2]>,
+    /// Present when the page is editing the render tuning.
+    #[serde(default)]
+    render: Option<ambient::Render>,
+}
+
+/// Which field the operator is holding on screen.
+#[derive(Debug, Deserialize)]
+struct FieldRequest {
+    field: String,
 }
 
 /// Persist a calibration and put it to work immediately.
@@ -649,6 +759,8 @@ async fn api_calibration_save(
         )
             .into_response();
     };
+
+    let stored = ambient.calibration();
 
     if request.corners.len() != ambient::CORNERS {
         return (
@@ -676,12 +788,136 @@ async fn api_calibration_save(
         depth: request.depth,
         linear: request.linear.unwrap_or(true),
         corners,
+        // Whatever was already measured or tuned is carried over: saving the
+        // corners again must not throw away a flat field or a tuning that took
+        // several minutes of standing in front of the television to get right.
+        render: request
+            .render
+            .or_else(|| stored.as_ref().map(|saved| saved.render))
+            .unwrap_or_default(),
+        black: stored.as_ref().and_then(|saved| saved.black),
+        white: stored.as_ref().and_then(|saved| saved.white),
     };
 
     match ambient.save(calibration) {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         // A refused calibration is the operator's problem, not the server's, so
         // the reason goes back to the page rather than into the log alone.
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// A black field brighter than this, in linear light, is not a black field.
+const MAX_BLACK_FIELD: f32 = 0.25;
+
+/// Measure the flat field the operator is holding on screen.
+///
+/// White is what turns the camera into an instrument: every zone sees the same
+/// colour, so every difference between them is the camera, the lens or the way it
+/// is mounted. Black is the floor it reports with nothing on screen. Both belong
+/// to where the camera sits, which is why they are stored with the calibration
+/// rather than passed in at startup.
+async fn api_calibration_field(
+    State(state): State<AppState>,
+    Json(request): Json<FieldRequest>,
+) -> Response {
+    let Some(ambient) = state.ambient.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let Some(stored) = ambient.calibration() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "set the four corners before measuring a field" })),
+        )
+            .into_response();
+    };
+
+    let field = request.field.as_str();
+    if field != "white" && field != "black" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "field must be \"white\" or \"black\"" })),
+        )
+            .into_response();
+    }
+
+    let measurement = match ambient.measure().await {
+        Ok(measurement) => measurement,
+        Err(err) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut calibration = (*stored).clone();
+
+    if field == "white" {
+        // A clipped sample is a value that was cut off before it was measured, so
+        // the gain it would produce is unknown rather than wrong. Refusing is the
+        // only honest answer.
+        if measurement.worst_clip() > ambient::CLIP_SAMPLE_FRACTION {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "the white field is over-exposed: lower the television's \
+                              brightness or move the camera back, then try again",
+                })),
+            )
+                .into_response();
+        }
+        if measurement.brightest() < 4.0 * sampling::MIN_MEASURED_WHITE {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "the screen does not look white: put the white field up \
+                              and wait for it to fill the screen",
+                })),
+            )
+                .into_response();
+        }
+        calibration.white = Some(measurement.linear);
+    } else {
+        if measurement.brightest() > MAX_BLACK_FIELD {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "the screen does not look black: put the black field up \
+                              and wait for it to fill the screen",
+                })),
+            )
+                .into_response();
+        }
+        calibration.black = Some(measurement.linear);
+    }
+
+    let spread = calibration
+        .correction()
+        .map(|correction| correction.spread());
+
+    match ambient.save(calibration) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "field": field,
+            "white": ambient
+                .calibration()
+                .is_some_and(|saved| saved.white.is_some()),
+            "black": ambient
+                .calibration()
+                .is_some_and(|saved| saved.black.is_some()),
+            // How far apart the zones read on the white field, as a fraction of
+            // the mean. Large numbers mean the correction is doing real work; a
+            // number near zero means the camera was already even.
+            "spread": spread,
+        }))
+        .into_response(),
         Err(err) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": err.to_string() })),

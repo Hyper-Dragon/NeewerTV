@@ -60,7 +60,6 @@ fn spawn_ambient_bridge(
     ambient: neewertv::ambient::Handle,
     commands: mpsc::Sender<Message>,
     snapshot: watch::Receiver<Snapshot>,
-    render: neewertv::ambient::render::Render,
 ) {
     tokio::spawn(async move {
         let mut watching = ambient.watching();
@@ -123,7 +122,7 @@ fn spawn_ambient_bridge(
                 .map_or(1000, |level| (u32::from(level) * 1000 + 127) / 255)
                 as u16;
 
-            let entries = neewertv::ambient::render::entries(&reading.colours, render);
+            let entries = neewertv::ambient::render::entries(&reading.colours, reading.render);
 
             // Dropped rather than queued when the worker is behind: a colour from
             // two frames ago is worse than no colour, and the link is slower than
@@ -308,17 +307,7 @@ async fn run() -> anyhow::Result<()> {
     // and nothing else. The preview stream is the lease, so leaving the page is
     // what puts the strip back.
     if let Some(handle) = &ambient {
-        spawn_ambient_bridge(
-            handle.clone(),
-            command_tx.clone(),
-            snapshot_rx.clone(),
-            neewertv::ambient::render::Render {
-                black_level: config.ambient.black_level,
-                saturation_gain: config.ambient.saturation_gain,
-                lightness_gain: config.ambient.lightness_gain,
-                ..Default::default()
-            },
-        );
+        spawn_ambient_bridge(handle.clone(), command_tx.clone(), snapshot_rx.clone());
     }
 
     let link = BluetoothLink::new(

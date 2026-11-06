@@ -1,8 +1,8 @@
 # Ambient capture and calibration
 
-Status: **experimental**. Capture, geometry, sampling and the calibration screen
-are implemented and tested. Nothing sends the twenty colours to the strip yet —
-that is the next slice.
+Status: **experimental**. Capture, geometry, sampling, flat-field calibration and
+the calibration screen are implemented and tested. While the calibration page is
+open the strip follows the camera live; there is no persistent ambient mode yet.
 
 ## What it is
 
@@ -97,7 +97,7 @@ entry, which makes the test scale-free.
 
 ## Colour
 
-Tier 0 only: no calibration pass, just better arithmetic.
+Tier 0 arithmetic, then Tier 1 flat field.
 
 - **Average in linear light.** sRGB is gamma-encoded; a flat mean of encoded values
   under-reports brightness. A half-black, half-white zone reads about 126 encoded
@@ -110,38 +110,83 @@ Tier 0 only: no calibration pass, just better arithmetic.
 - Output rounds rather than truncates: a flat 128 comes back as 127.9999 and
   truncation would report 127, making a lossless round trip look lossy.
 
+## The flat field
+
+The pale band down one side and the colour cast across a uniform white screen are
+not the screen: they are the camera. A lens is dimmer at its edges than at its
+centre, a camera is rarely square-on, and the room is rarely symmetric. Nothing
+about that is visible in a single frame of a film, and nothing about it can be
+worked out from the corner positions.
+
+So it is measured instead. Two buttons on the calibration page:
+
+- **White** with a full-screen white field up. Every zone should see the same
+  colour, so every difference between them is the camera. Each zone-and-channel
+  gets a gain of `mean ÷ measured`, which flattens the shading and leaves the
+  overall exposure alone. Over-exposed zones are refused rather than corrected: a
+  clipped sample was cut off before it was measured, so the gain it would produce
+  is unknown. Turn the screen's brightness down, or move the camera back.
+- **Black** with a full-screen black field up. This is the floor the camera reports
+  with nothing on screen, and it is subtracted from every sample. A black field
+  that reads as anything but black is refused — that is the room, not the screen.
+
+Each measurement averages twenty frames, which is what makes sensor noise a
+non-issue. Either field can be measured on its own: white alone already flattens
+the shading, black alone already removes the floor.
+
+Correction is applied per sample in linear light, before the average, because an
+affine map does not commute with averaging — `(a − b)·g` averaged is not the same
+as the average of `a` scaled.
+
+Gains are clamped to 0.25–4.0. A zone that measured almost nothing would otherwise
+get an enormous multiplier and turn sensor noise into a light show.
+
 ## What the strip is actually sent
 
 `rgb_to_hsi` reports what the camera saw. The firmware does not render that well,
 so a reading is lifted on the way out (`src/ambient/render.rs`):
 
-- **The black point is reset first** — `AMBIENT_BLACK_LEVEL`, default 10. A camera
-  without a locked exposure raises gain in the dark until a black screen reads as
-  mid grey, and the strip then never dims; this is the software answer to that,
-  and locking the exposure (Tier 3) is the real one.
-- **Saturation is multiplied** — `AMBIENT_SATURATION_GAIN`, default 2. A dim,
-  desaturated sample, which is what an averaged low-light frame produces, comes
-  back from the firmware as near-white instead of as the colour it describes.
-- **Lightness is scaled above a small floor** — `AMBIENT_LIGHTNESS_GAIN`, default
-  1.4, floor 8. Measured on an NS03: segments do not light at all below about
-  L=20. The floor exists so that a genuinely dark scene stays dark; lifting every
-  zone by a constant would make a black film glow, which is the defect the whole
-  feature exists to avoid.
+- **The black point is reset first** — `black_level`, default 10. A camera without
+  a locked exposure raises gain in the dark until a black screen reads as mid grey,
+  and the strip then never dims; this is the software answer to that, and locking
+  the exposure (Tier 3) is the real one.
+- **Saturation is multiplied** — `saturation_gain`, default 2. A dim, desaturated
+  sample, which is what an averaged low-light frame produces, comes back from the
+  firmware as near-white instead of as the colour it describes.
+- **Lightness is scaled above a small floor** — `lightness_gain`, default 1.4,
+  floor 8. Measured on an NS03: segments do not light at all below about L=20. The
+  floor exists so that a genuinely dark scene stays dark; lifting every zone by a
+  constant would make a black film glow, which is the defect the whole feature
+  exists to avoid.
 
-Hue is never touched. Both gains are guesses about the device's transfer curve,
-which is why they are settings rather than constants — measuring the curve, with
-the camera pointed at the strip's own light and a known (lightness, saturation)
-grid, is what would turn them into facts.
+Hue is never touched.
+
+These three live in the calibration file, not in the environment, and are edited on
+the calibration page with the swatches in front of you. They are judgements made
+while looking at the screen and the strip together — a compose file cannot offer
+that — and they belong to the screen they were tuned for. The page draws its
+swatches from the same `(lightness, hue, saturation)` triples the strip is sent, so
+what you see is what the strip will do.
+
+All three are still guesses about the device's transfer curve. Measuring the curve
+properly — camera pointed at the strip's own light, a known grid of
+`(lightness, saturation)` — is what would turn them into facts.
 
 ## Not done yet
 
 - The mode as a selectable state: a preview that only runs while a page is open is
   not the same thing as "this light is in ambient mode".
 - Reading the mode back from a strip that cannot report it.
-- Tiers 1–3: flat-field and black-level correction, a colour-correction matrix, and
-  locking exposure. For a calibration driven by a video on the television, locking
-  exposure has to happen *first*, or the white and black fields are measured at
-  different gains.
+- **Tier 3, locking exposure.** This is the real fix for a camera that lifts black
+  to mid grey in a dark scene, and it has to happen before the flat field is
+  measured: the white and black fields have to be captured at the same gain, or the
+  two halves describe two different cameras.
+- **Tier 2, a colour-correction matrix.** A camera's red is not the screen's red,
+  and the strip's red is not either. Fitting a 3×3 between camera and screen is a
+  measurement, not a guess, and it is the step after the flat field.
+- Sampling outside the screen, when the film's border does not fill the panel.
+- Capturing the fields automatically from the calibration video rather than asking
+  the operator to drive them by hand.
 
 Aspect is fixed at 16:9 and is no longer a control on the page. Every strip this
 supports is built around a 16:9 panel, and a wrong aspect silently skews the

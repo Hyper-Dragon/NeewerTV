@@ -339,17 +339,15 @@ the compose file.
 | `AMBIENT_CAMERA` | `/dev/video0` | The V4L2 device the ambient sampler reads. Only used when ambient capture is on. |
 | `AMBIENT_CALIBRATION` | `/data/ambient-calibration.json` | Where the four clicked corners live. Put it on a volume, or you re-click after every update. |
 | `AMBIENT_MAX_FPS` | `15` | Upper bound on samples per second, `0` for no bound. It bounds the work on a small box with an eager camera; the Bluetooth link cannot carry more than this anyway. |
-| `AMBIENT_SATURATION_GAIN` | `2.0` | How hard a sampled colour's saturation is pushed before it is sent. The firmware renders low saturation as white, so this is what stops a dim scene coming out colourless. |
-| `AMBIENT_LIGHTNESS_GAIN` | `1.4` | Scale applied to lightness above the firmware's dead zone — segments do not light at all below about L=20. Black stays black, because the gain only applies above a small floor. |
-| `AMBIENT_BLACK_LEVEL` | `10` | What the camera reports for a black screen. Without a locked exposure the camera raises gain in the dark until black reads as mid grey, and the strip then never dims. Set this to the value the swatches show while the screen is black. |
 | `LOG_LEVEL` | `info` | A `tracing` directive, so `info,neewertv::ble=debug` works. |
 | `LOG_FORMAT` | `text` | `text`, or `json` if you're shipping logs somewhere. |
 | `DBUS_SYSTEM_BUS_ADDRESS` | — | Set to `unix:path=/run/dbus/system_bus_socket` inside the container. The compose file does it for you. |
 
 ## Ambient calibration
 
-> **Experimental, and not connected to the strip yet.** The calibration screen,
-> the capture and the sampler all run; nothing sends the twenty colours anywhere.
+> **Experimental.** Capture, geometry, sampling and calibration all run, and the
+> strip follows the camera while the calibration page is open. There is no
+> persistent ambient mode yet.
 > Details and the geometry: [`docs/AMBIENT.md`](docs/AMBIENT.md).
 
 A camera pointed at the screen, four clicked corners, and twenty sampled colours —
@@ -371,6 +369,21 @@ Open `/calibrate`, click the four corners of the screen — top-left, top-right,
 bottom-right, bottom-left — and save. The calibration is written to
 `AMBIENT_CALIBRATION` and read back on every start, so a camera that never moves is
 only calibrated once.
+
+Then measure the two flat fields, which is the part that turns a camera into an
+instrument. Play the white field full-screen (the calibration video, or any
+full-screen white image), press **Measure white**, and every zone's gain is set so a
+uniform screen reads uniform: the camera's lens shading, its angle and the light in
+the room stop showing up as a pale band down one side. Do the same with the black
+field to find the floor the camera reports with nothing on screen. Either one can be
+measured on its own.
+
+The three strip tuning values — black level, colour gain, light gain — are on the
+same page, next to swatches drawn from the exact `(lightness, hue, saturation)`
+triples the strip is sent. They are stored **in the calibration file**, not in the
+environment: they are judgements about this screen and this strip, made while
+looking at both, and they move with the calibration rather than with the compose
+file. Re-saving the corners never discards them.
 
 **While the calibration page is open, the strip follows the camera** — twenty
 segments, at the brightness the light is already set to. Leaving the page puts the

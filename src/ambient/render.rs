@@ -19,6 +19,8 @@
 //! until somebody measures the device's transfer curve with the camera pointed at
 //! its own light. They are exposed through the environment for that reason.
 
+use serde::{Deserialize, Serialize};
+
 use crate::protocol::hsi::rgb_to_hsi;
 
 /// One segment colour, in the order the wire wants it.
@@ -28,9 +30,17 @@ pub const DEFAULT_SATURATION_GAIN: f32 = 2.0;
 pub const DEFAULT_LIGHTNESS_GAIN: f32 = 1.4;
 pub const DEFAULT_LIGHTNESS_FLOOR: u8 = 8;
 pub const DEFAULT_BLACK_LEVEL: u8 = 10;
+/// Above this a black level is a darkening knob rather than a correction.
+pub const MAX_BLACK_LEVEL: u8 = 64;
+/// Gains beyond this are almost certainly a mistake rather than a setting.
+pub const MAX_GAIN: f32 = 8.0;
 
 /// How a reading is pushed towards what the firmware renders well.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Part of the calibration file, not the environment: every one of these is a
+/// judgement made while looking at the screen and the strip together, which is a
+/// thing the calibration page can offer and a compose file cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Render {
     /// Every channel at or below this is treated as black, and the rest is
     /// rescaled so white stays white.
@@ -39,13 +49,43 @@ pub struct Render {
     /// zero: aimed at a dark scene it raises gain until the screen reads as mid
     /// grey, and the strip then stays lit through the whole film. Set this to the
     /// value the swatches show while the screen is black.
+    #[serde(default = "default_black_level")]
     pub black_level: u8,
     /// Multiplier on saturation. The firmware renders low saturation as white.
+    #[serde(default = "default_saturation_gain")]
     pub saturation_gain: f32,
     /// Multiplier on the part of lightness above [`Self::lightness_floor`].
+    #[serde(default = "default_lightness_gain")]
     pub lightness_gain: f32,
     /// Lightness at or below this passes through untouched, so black stays black.
+    #[serde(default = "default_lightness_floor")]
     pub lightness_floor: u8,
+}
+
+fn default_black_level() -> u8 {
+    DEFAULT_BLACK_LEVEL
+}
+
+fn default_saturation_gain() -> f32 {
+    DEFAULT_SATURATION_GAIN
+}
+
+fn default_lightness_gain() -> f32 {
+    DEFAULT_LIGHTNESS_GAIN
+}
+
+fn default_lightness_floor() -> u8 {
+    DEFAULT_LIGHTNESS_FLOOR
+}
+
+impl Render {
+    /// Reject values that would turn a setting into a mistake.
+    pub fn is_sane(&self) -> bool {
+        self.black_level <= MAX_BLACK_LEVEL
+            && self.lightness_floor <= 100
+            && (0.0..=MAX_GAIN).contains(&self.saturation_gain)
+            && (0.0..=MAX_GAIN).contains(&self.lightness_gain)
+    }
 }
 
 impl Default for Render {

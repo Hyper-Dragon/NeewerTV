@@ -23,16 +23,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 pub use calibration::{Calibration, FrameSize};
 pub use geometry::{Homography, Rect, zone_rects};
-pub use sampling::{Frame, Reading, Rgb, Sampler};
+pub use render::Render;
+pub use sampling::{Correction, Frame, Measurement, Reading, Rgb, Sampler};
 
 /// Format of the calibration file. Bumped when the meaning of a field changes.
-pub const CALIBRATION_VERSION: u32 = 1;
+///
+/// Version 1 had no flat field and no render tuning; both are supplied by serde
+/// defaults when an old file is read, and it is rewritten as version 2.
+pub const CALIBRATION_VERSION: u32 = 2;
+
+/// How many frames a flat-field measurement averages over.
+///
+/// Enough to beat sensor noise, few enough that holding a white field for a
+/// second and a half is plenty.
+pub const MEASURE_FRAMES: usize = 20;
+
+/// The channel a measurement request travels on.
+type MeasureReply = oneshot::Sender<anyhow::Result<Measurement>>;
 
 /// Addressable segments on the strip. Segments are equal length along the strip;
 /// the *zones* they are fed from are not, because the corners are squares.
@@ -117,6 +130,12 @@ pub struct Latest {
     pub fps: f32,
     /// False until a calibration has been saved: there is nothing to sample yet.
     pub calibrated: bool,
+    /// How the reading should be pushed towards what the firmware renders well.
+    ///
+    /// Carried with the reading rather than read from the environment, because it
+    /// is part of the calibration: it is tuned while looking at the screen and the
+    /// strip together, and it has to change when the calibration changes.
+    pub render: Render,
 }
 
 impl Latest {
@@ -129,6 +148,7 @@ impl Latest {
             clipped_zones: 0,
             fps,
             calibrated: false,
+            render: Render::default(),
         }
     }
 }
@@ -143,6 +163,7 @@ pub struct Handle {
     calibration: Arc<RwLock<Option<Arc<Calibration>>>>,
     path: PathBuf,
     viewing: Arc<Viewing>,
+    measure: mpsc::Sender<MeasureReply>,
 }
 
 impl Handle {
@@ -186,6 +207,21 @@ impl Handle {
     /// Whether anybody is looking, for whoever drives the strip.
     pub fn watching(&self) -> watch::Receiver<bool> {
         self.viewing.change.subscribe()
+    }
+
+    /// Measure the screen as it is right now, averaged over a few frames.
+    ///
+    /// Goes through the sampling task rather than reading the frame channel here,
+    /// because that task already owns the geometry and sees every frame.
+    pub async fn measure(&self) -> anyhow::Result<Measurement> {
+        let (reply, answer) = oneshot::channel();
+        self.measure
+            .send(reply)
+            .await
+            .map_err(|_| anyhow::anyhow!("the ambient sampler is not running"))?;
+        answer
+            .await
+            .map_err(|_| anyhow::anyhow!("the ambient sampler dropped the measurement"))?
     }
 
     /// Persist a calibration and put it to work.
@@ -276,6 +312,7 @@ pub fn start(
     let (frames_tx, frames_rx) = watch::channel(None);
     let (latest_tx, latest_rx) = watch::channel(None);
     let (change, _) = watch::channel(false);
+    let (measure_tx, measure_rx) = mpsc::channel(1);
     let calibration = Arc::new(RwLock::new(stored));
 
     camera::spawn(device, frames_tx, shutdown.clone());
@@ -285,6 +322,7 @@ pub fn start(
         latest_tx,
         Arc::clone(&calibration),
         max_fps,
+        measure_rx,
         shutdown,
     ));
 
@@ -297,6 +335,7 @@ pub fn start(
             open: AtomicUsize::new(0),
             change,
         }),
+        measure: measure_tx,
     }
 }
 
@@ -310,6 +349,7 @@ async fn sample_frames(
     latest: watch::Sender<Option<Arc<Latest>>>,
     calibration: Arc<RwLock<Option<Arc<Calibration>>>>,
     max_fps: u8,
+    mut requests: mpsc::Receiver<MeasureReply>,
     shutdown: CancellationToken,
 ) {
     let mut sampler: Option<Sampler> = None;
@@ -324,13 +364,23 @@ async fn sample_frames(
     let mut last_sampled: Option<Instant> = None;
 
     loop {
-        tokio::select! {
+        // The measurement arm has to borrow the frame channel too, so the select
+        // only decides *what* happened and the work happens after it.
+        let measured = tokio::select! {
             () = shutdown.cancelled() => break,
+            reply = requests.recv() => reply,
             changed = frames.changed() => {
                 if changed.is_err() {
                     break;
                 }
+                None
             }
+        };
+
+        if let Some(reply) = measured {
+            let outcome = measure_over(&mut frames, sampler.as_ref(), MEASURE_FRAMES).await;
+            let _ = reply.send(outcome);
+            continue;
         }
 
         let Some(frame) = frames.borrow_and_update().clone() else {
@@ -355,7 +405,7 @@ async fn sample_frames(
         };
         if !unchanged {
             sampler = current.as_ref().and_then(|next| Sampler::new(next));
-            sampler_for = current;
+            sampler_for = current.clone();
         }
 
         let fps = window.tick();
@@ -374,8 +424,61 @@ async fn sample_frames(
             clipped_zones: reading.clipped_zones,
             fps,
             calibrated: true,
+            render: current.map_or_else(Render::default, |calibration| calibration.render),
         })));
     }
+}
+
+/// Average the next few frames into one measurement.
+///
+async fn measure_over(
+    frames: &mut watch::Receiver<Option<Arc<Frame>>>,
+    sampler: Option<&Sampler>,
+    count: usize,
+) -> anyhow::Result<Measurement> {
+    let Some(sampler) = sampler else {
+        anyhow::bail!("there is no calibration to measure through yet");
+    };
+
+    let mut sum = [[0.0_f32; 3]; SEGMENTS];
+    let mut worst = [0.0_f32; SEGMENTS];
+    let mut seen = 0_usize;
+
+    while seen < count {
+        if frames.changed().await.is_err() {
+            anyhow::bail!("the camera stopped while the field was being measured");
+        }
+
+        let frame = {
+            let borrowed = frames.borrow_and_update();
+            (*borrowed).clone()
+        };
+        let Some(frame) = frame else {
+            continue;
+        };
+
+        let measurement = sampler.measure(&frame);
+        for (zone, channels) in measurement.linear.iter().enumerate() {
+            for (channel, value) in channels.iter().enumerate() {
+                sum[zone][channel] += value;
+            }
+            worst[zone] = worst[zone].max(measurement.clipped[zone]);
+        }
+        seen += 1;
+    }
+
+    let count = seen as f32;
+    let mut linear = [[0.0_f32; 3]; SEGMENTS];
+    for (zone, channels) in linear.iter_mut().enumerate() {
+        for (channel, value) in channels.iter_mut().enumerate() {
+            *value = sum[zone][channel] / count;
+        }
+    }
+
+    Ok(Measurement {
+        linear,
+        clipped: worst,
+    })
 }
 
 /// Frames per second, averaged over a second so the page does not flicker
