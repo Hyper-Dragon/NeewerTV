@@ -32,6 +32,16 @@ pub enum LinkError {
     #[error("write: {0}")]
     Write(String),
 
+    /// The stack is still busy with the previous write.
+    ///
+    /// BlueZ answers `org.bluez.Error.InProgress` when a second write arrives
+    /// before the first has been acknowledged on air. It is a queueing answer,
+    /// not a failure: nothing is lost and the link is intact. Treating it as a
+    /// drop is what stops the daemon writing anything at all — it marks the link
+    /// down, and because the handle is still open it never re-attaches.
+    #[error("busy: {0}")]
+    Busy(String),
+
     #[error("no state report within {0:?}")]
     NoReply(Duration),
 

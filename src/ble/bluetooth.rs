@@ -485,6 +485,13 @@ impl Link for BluetoothLink {
             match tokio::time::timeout(WRITE_TIMEOUT, device.write(write_char, frame, write_type))
                 .await
             {
+                // `InProgress` is BlueZ queueing, not a broken link. It has to be
+                // its own error or the worker cannot tell the two apart, and
+                // telling them apart is the difference between dropping one frame
+                // and stopping for good.
+                Ok(Err(err)) if err.to_string().contains("In Progress") => {
+                    Err(LinkError::Busy(err.to_string()))
+                }
                 Ok(result) => result.map_err(|err| LinkError::Write(err.to_string())),
                 Err(_) => Err(LinkError::Write(format!(
                     "no acknowledgement within {}s",

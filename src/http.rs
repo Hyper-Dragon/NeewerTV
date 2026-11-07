@@ -1105,6 +1105,15 @@ const MAX_BLACK_FIELD: f32 = 0.25;
 /// as full range.
 const LIFTED_BLACK: f32 = 0.01;
 
+/// A white field this flat is not a picture of a lens.
+///
+/// Every real camera is a few percent darker at the edges than in the middle,
+/// and sits at an angle to the screen. A white field that comes back the same in
+/// all twenty zones means the camera clipped to a plateau, or the screen was not
+/// the white field at all — and either way the gains it produces are all 1.0, so
+/// the half of the flat field that is supposed to flatten the camera does nothing.
+const SUSPICIOUSLY_FLAT: f32 = 1.02;
+
 /// Measure the flat field the operator is holding on screen.
 ///
 /// White is what turns the camera into an instrument: every zone sees the same
@@ -1150,6 +1159,12 @@ async fn api_calibration_field(
 
     let mut calibration = (*stored).clone();
     let brightest = measurement.brightest();
+    let dimmest = measurement
+        .linear
+        .iter()
+        .flat_map(|zone| zone.iter())
+        .copied()
+        .fold(f32::MAX, f32::min);
 
     if field == "white" {
         // A clipped sample is a value that was cut off before it was measured, so
@@ -1205,6 +1220,16 @@ async fn api_calibration_field(
             brightest * 100.0
         )
     });
+    let flat =
+        (field == "white" && dimmest > 0.0 && brightest < dimmest * SUSPICIOUSLY_FLAT).then(|| {
+            format!(
+                "every zone read {:.0}%, so this is not a picture of a camera — the white \
+                 field was clipped or the screen was not white, and the flattening half of \
+                 the correction will do nothing",
+                brightest * 100.0
+            )
+        });
+    let warning = lifted.or(flat);
 
     match ambient.save(calibration) {
         Ok(()) => Json(json!({
@@ -1223,7 +1248,7 @@ async fn api_calibration_field(
             // What the brightest zone saw, in linear light. The number the black
             // field exists to establish.
             "level": brightest,
-            "warning": lifted,
+            "warning": warning,
         }))
         .into_response(),
         Err(err) => (

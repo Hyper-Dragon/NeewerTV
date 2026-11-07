@@ -69,6 +69,14 @@ const ALERT_REPLY_MS: u64 = 400;
 /// schedule rather than inside a single command.
 const IMMEDIATE_ATTEMPTS: u32 = 2;
 
+/// How many times a write the stack called busy is retried, and how far apart.
+///
+/// A busy write is not a lost one: it is a frame that arrived while the previous
+/// one was still on air. Three tries at ten milliseconds covers a connection
+/// interval or two, which is longer than any write this daemon sends.
+const BUSY_RETRIES: u32 = 3;
+const BUSY_RETRY: Duration = Duration::from_millis(10);
+
 /// How long a keep-alive waits for its own reply before giving up on it.
 ///
 /// The answer is discarded either way; the wait only exists so the worker does
@@ -1019,10 +1027,34 @@ impl<L: Link> Worker<L> {
         }
 
         for frame in frames {
-            match self.link.write(frame, kind).await {
+            // `Busy` means the stack still has the previous write in flight. It is
+            // the one failure that says nothing about the link, so it is retried
+            // rather than counted: a camera frame arriving while the last one is
+            // still on air is the normal case, not an error.
+            let mut attempt = 0;
+            let written = loop {
+                match self.link.write(frame, kind).await {
+                    Ok(()) => break Ok(()),
+                    Err(LinkError::Busy(_)) if attempt < BUSY_RETRIES => {
+                        attempt += 1;
+                        tokio::time::sleep(BUSY_RETRY).await;
+                    }
+                    Err(err) => break Err(err),
+                }
+            };
+
+            match written {
                 Ok(()) => {
                     self.snapshot.writes_sent += 1;
                     self.last_traffic = self.now;
+                    self.snapshot.connected = true;
+                }
+                Err(LinkError::Busy(err)) => {
+                    // Still busy after every retry: the frame is stale by now, and
+                    // dropping it is exactly what the ambient path does anyway. The
+                    // link is left alone.
+                    self.snapshot.last_error = Some(format!("busy: {err}"));
+                    return Ok(());
                 }
                 Err(err) => {
                     // The link was up and would not take the write. This is the
@@ -1123,6 +1155,9 @@ mod tests {
         /// Writes to reject, counting down. The write is refused *before* it is
         /// recorded, so the reply is not a lie about what reached the device.
         fail_writes: u32,
+        /// Writes to answer with `Busy`, counting down. Models BlueZ telling us
+        /// the previous write is still on air.
+        busy_writes: u32,
         /// What a state query answers, if anything. `None` models a strip that
         /// never replies, which is what a real timeout looks like here.
         report: Option<StateReport>,
@@ -1181,6 +1216,10 @@ mod tests {
                 if state.fail_writes > 0 {
                     state.fail_writes -= 1;
                     return Err(LinkError::Write("write failed".into()));
+                }
+                if state.busy_writes > 0 {
+                    state.busy_writes -= 1;
+                    return Err(LinkError::Busy("In Progress".into()));
                 }
                 if frame.get(1) == Some(&ID_QUERY_STATE) {
                     state.queries += 1;
@@ -2267,6 +2306,30 @@ mod tests {
         )
         .await;
         assert!(!taken.preview, "a user command ends the preview");
+    }
+
+    #[tokio::test]
+    async fn a_busy_write_is_retried_rather_than_called_a_drop() {
+        // BlueZ answers `InProgress` when a second write arrives before the first
+        // has been acknowledged. Nothing is lost, and the link is intact — but
+        // treating it as a drop marks the link down forever, because the handle is
+        // still open so nothing ever re-attaches. That is the failure that stops a
+        // preview dead while the page keeps drawing colours.
+        let (link, state) = FakeLink::new(0);
+        state.lock().unwrap().busy_writes = 2;
+
+        let (state, _) =
+            drain_paced(Worker::new(link), vec![Message::Batch(brightness(500))]).await;
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.attaches, 1,
+            "a busy write is not a reason to re-attach"
+        );
+        assert!(
+            !state.writes.is_empty(),
+            "the command must land once the stack is free"
+        );
     }
 
     #[tokio::test]
