@@ -65,11 +65,20 @@ fn spawn_ambient_bridge(
         let mut watching = ambient.watching();
         let mut measuring = ambient.measuring();
         let mut latest = ambient.latest_changes();
-        let mut previewing = false;
         let mut measuring_now = false;
+
+        // A command from the user takes the strip away from the preview. That is
+        // right, but it must not be permanent: the page goes on drawing colours
+        // that nobody can see. Once they have stopped commanding, the preview
+        // takes the strip back.
+        let mut quiet_since = tokio::time::Instant::now();
+        let mut last_commands = snapshot.borrow().commands_received;
+        let mut recheck = tokio::time::interval(PREVIEW_RECHECK);
+        recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
+                _ = recheck.tick() => {}
                 changed = watching.changed() => {
                     if changed.is_err() {
                         break;
@@ -86,6 +95,17 @@ fn spawn_ambient_bridge(
                     }
                 }
             }
+
+            // The worker is the one that knows: it publishes whether the strip is
+            // being driven, which stays false after a command until somebody asks
+            // for it again.
+            let published = snapshot.borrow().clone();
+            if published.commands_received != last_commands {
+                last_commands = published.commands_received;
+                quiet_since = tokio::time::Instant::now();
+            }
+            let previewing = published.preview;
+            let settled = quiet_since.elapsed() >= PREVIEW_QUIET;
 
             // A flat field is measured with the strip dark: the light that would
             // otherwise land on the screen is the strip's own, and it would be
@@ -109,29 +129,29 @@ fn spawn_ambient_bridge(
             // first calibrated reading — which is what happens when the operator
             // saves a calibration from the page they already have open. A
             // measurement does not end the preview: it only stops the frames.
-            let ready = *watching.borrow_and_update()
+            let wanted = *watching.borrow_and_update()
                 && latest
                     .borrow()
                     .as_ref()
                     .is_some_and(|reading| reading.calibrated);
 
-            if ready != previewing {
-                previewing = ready;
-                let message = if ready {
-                    Message::AmbientStart
-                } else {
-                    Message::AmbientStop
-                };
-                if commands.send(message).await.is_err() {
+            if previewing && !wanted {
+                if commands.send(Message::AmbientStop).await.is_err() {
                     break;
                 }
-            }
-
-            if !ready || now_measuring {
                 continue;
             }
 
-            if !ready {
+            if wanted && !previewing {
+                if settled && commands.send(Message::AmbientStart).await.is_err() {
+                    break;
+                }
+                // Nothing to send yet: the start is what re-arms it, and the next
+                // pass will find the preview running.
+                continue;
+            }
+
+            if !wanted || !previewing || now_measuring {
                 continue;
             }
 
@@ -185,6 +205,18 @@ const BODY_OK: &str = "\"status\":\"ok\"";
 /// so this is comfortably finer than the resolution that matters.
 const TICK: Duration = Duration::from_millis(250);
 
+/// How long the preview waits after the last user command before taking the
+/// strip back.
+///
+/// A command wins while it is being made — a slider drag is a stream of them —
+/// but a page left open with the strip frozen on one colour is a page that lies.
+const PREVIEW_QUIET: Duration = Duration::from_millis(1500);
+
+/// How often the ambient bridge looks again when nothing has changed.
+///
+/// Everything else it waits on is an event; this exists so that "the user has
+/// stopped commanding" can be noticed at all.
+const PREVIEW_RECHECK: Duration = Duration::from_millis(400);
 fn main() -> anyhow::Result<()> {
     // Checked before the runtime starts so the probe costs a TCP connect, not a
     // whole tokio setup.

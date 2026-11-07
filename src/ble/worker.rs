@@ -150,6 +150,12 @@ pub struct Snapshot {
     pub commands_received: u64,
     pub commands_coalesced: u64,
     pub writes_sent: u64,
+    /// Whether the strip is being driven by the ambient preview right now.
+    ///
+    /// Published because the failure this prevents is silent: a user command
+    /// takes the strip over, the page keeps drawing colours, and nothing says
+    /// that those colours are going nowhere.
+    pub preview: bool,
     /// Ambient frames that were superseded before they could be written.
     ///
     /// Not a fault: the camera samples faster than the link can carry, and a
@@ -286,8 +292,10 @@ impl<L: Link> Worker<L> {
                     self.snapshot.commands_received += 1;
                     // A command from the user outranks a preview. Ending it here
                     // means the next camera frame is dropped rather than
-                    // overwriting what they just asked for a frame later.
+                    // overwriting what they just asked for a frame later. The
+                    // bridge puts the preview back once they have stopped.
                     self.ambient = None;
+                    self.snapshot.preview = false;
                     self.queue.push(batch);
 
                     // Absorb whatever else is already waiting, so a slider drag
@@ -456,6 +464,7 @@ impl<L: Link> Worker<L> {
                             }
                         }
                         tracing::info!("ambient preview started");
+                        self.snapshot.preview = true;
                     }
                 }
 
@@ -498,9 +507,14 @@ impl<L: Link> Worker<L> {
                             brightness,
                         }) {
                             Ok(frames) => {
-                                if let Err(failure) =
-                                    self.write_all_as(&frames, WriteKind::Unacknowledged).await
-                                {
+                                // Acknowledged, deliberately. The strip accepts an
+                                // unacknowledged write at this characteristic and
+                                // then does nothing with it, and a frame that is
+                                // silently ignored is worse than one that is slow:
+                                // the counters say the preview is healthy while the
+                                // light sits still. Dropping the backlog, not the
+                                // acknowledgement, is what removes the lag.
+                                if let Err(failure) = self.write_all(&frames).await {
                                     self.snapshot.last_error = Some(failure.error.to_string());
                                 }
                             }
@@ -556,6 +570,7 @@ impl<L: Link> Worker<L> {
                             self.snapshot.last_error = Some(failure.error.to_string());
                         }
                         self.snapshot.on = preview.was_on;
+                        self.snapshot.preview = false;
                         tracing::info!("ambient preview stopped; strip restored");
                     }
                 }
@@ -2186,21 +2201,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_ambient_frame_does_not_wait_for_an_acknowledgement() {
-        // This is the whole update rate on a link with a slow connection
-        // interval: an acknowledged write costs a round trip, and twenty a second
-        // is beyond what one costs.
-        let (link, state) = FakeLink::new(0);
-        drain(Worker::new(link), vec![Message::AmbientStart, ambient(30)]).await;
-
-        let state = state.lock().unwrap();
-        assert_eq!(
-            state.unacknowledged, 1,
-            "the camera frame takes the fast path"
-        );
-    }
-
-    #[tokio::test]
     async fn a_measurement_darkens_the_strip_and_drops_the_frames_it_would_show() {
         // The strip is a light source pointed at the screen being measured. In a
         // dark room its own output is most of what the camera sees, so a
@@ -2249,6 +2249,24 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.unacknowledged, 0);
         assert!(!state.writes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_preview_is_published_until_a_command_takes_the_strip_over() {
+        // The page keeps drawing colours either way, so this flag is the only
+        // thing that can tell an operator their colours are going nowhere.
+        let (link, _) = FakeLink::new(0);
+        let (_, previewing) =
+            drain_paced(Worker::new(link), vec![Message::AmbientStart, ambient(30)]).await;
+        assert!(previewing.preview, "the preview is driving the strip");
+
+        let (link, _) = FakeLink::new(0);
+        let (_, taken) = drain_paced(
+            Worker::new(link),
+            vec![Message::AmbientStart, Message::Batch(brightness(500))],
+        )
+        .await;
+        assert!(!taken.preview, "a user command ends the preview");
     }
 
     #[tokio::test]

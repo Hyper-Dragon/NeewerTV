@@ -412,8 +412,12 @@ async function refresh() {
       const strip = meterStrip(latest.strip);
       if (!latest.strip || !latest.strip.connected) {
         bits.push('strip not connected');
+      } else if (!latest.strip.preview) {
+        bits.push('strip not following \u2014 a command took it over');
       } else if (strip && strip.rate > 0) {
         bits.push(strip.rate.toFixed(1) + '/s to the strip');
+      } else {
+        bits.push('nothing reaching the strip');
       }
       if (!latest.calibrated) bits.push('not calibrated');
       if (latest.clipped_zones > 0) bits.push(latest.clipped_zones + ' over-exposed');
@@ -861,6 +865,10 @@ async fn api_ambient(State(state): State<AppState>) -> Response {
             "connected": state.snapshot.borrow().connected,
             "writes_sent": state.snapshot.borrow().writes_sent,
             "frames_skipped": state.snapshot.borrow().frames_skipped,
+            // Whether the strip is being driven from here at all. False while a
+            // user command outranks the preview, which is otherwise invisible:
+            // the swatches keep moving and nothing reaches the light.
+            "preview": state.snapshot.borrow().preview,
         },
         "zones": zones,
     }))
