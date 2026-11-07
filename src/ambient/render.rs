@@ -30,6 +30,8 @@ pub const DEFAULT_SATURATION_GAIN: f32 = 2.0;
 pub const DEFAULT_LIGHTNESS_GAIN: f32 = 1.4;
 pub const DEFAULT_LIGHTNESS_FLOOR: u8 = 8;
 pub const DEFAULT_BLACK_LEVEL: u8 = 10;
+pub const DEFAULT_MAXIMUM_BRIGHTNESS: u8 = 100;
+pub const DEFAULT_MINIMUM_LIGHTNESS: u8 = 0;
 /// Above this a black level is a darkening knob rather than a correction.
 pub const MAX_BLACK_LEVEL: u8 = 64;
 /// Gains beyond this are almost certainly a mistake rather than a setting.
@@ -68,6 +70,21 @@ pub struct Render {
     /// Lightness at or below this passes through untouched, so black stays black.
     #[serde(default = "default_lightness_floor")]
     pub lightness_floor: u8,
+    /// Highest global brightness the strip is ever driven at, percent.
+    ///
+    /// A ceiling, not a level: the Home Assistant slider still scales everything
+    /// underneath it. Somebody who does not want a backlight that can light the
+    /// room up sets this once and stops thinking about it.
+    #[serde(default = "default_maximum_brightness")]
+    pub maximum_brightness: u8,
+    /// Lightness no segment is driven below, percent.
+    ///
+    /// Zero, the default, means a dark zone is genuinely off. Anything above it
+    /// keeps a faint glow everywhere — a base light for a room that is not meant
+    /// to go dark. Deliberately not on by default: a constant glow through a black
+    /// film is the defect this whole feature exists to avoid.
+    #[serde(default = "default_minimum_lightness")]
+    pub minimum_lightness: u8,
 }
 
 fn default_black_level() -> u8 {
@@ -86,11 +103,21 @@ fn default_lightness_floor() -> u8 {
     DEFAULT_LIGHTNESS_FLOOR
 }
 
+fn default_maximum_brightness() -> u8 {
+    DEFAULT_MAXIMUM_BRIGHTNESS
+}
+
+fn default_minimum_lightness() -> u8 {
+    DEFAULT_MINIMUM_LIGHTNESS
+}
+
 impl Render {
     /// Reject values that would turn a setting into a mistake.
     pub fn is_sane(&self) -> bool {
         self.black_level <= MAX_BLACK_LEVEL
             && self.lightness_floor <= 100
+            && self.maximum_brightness <= 100
+            && self.minimum_lightness <= 100
             && (0.0..=MAX_GAIN).contains(&self.saturation_gain)
             && (0.0..=MAX_GAIN).contains(&self.lightness_gain)
     }
@@ -103,6 +130,8 @@ impl Default for Render {
             saturation_gain: DEFAULT_SATURATION_GAIN,
             lightness_gain: DEFAULT_LIGHTNESS_GAIN,
             lightness_floor: DEFAULT_LIGHTNESS_FLOOR,
+            maximum_brightness: DEFAULT_MAXIMUM_BRIGHTNESS,
+            minimum_lightness: DEFAULT_MINIMUM_LIGHTNESS,
         }
     }
 }
@@ -121,6 +150,8 @@ impl Render {
             saturation_gain: 1.0,
             lightness_gain: 1.0,
             lightness_floor: 0,
+            maximum_brightness: 100,
+            minimum_lightness: 0,
         }
     }
 }
@@ -158,6 +189,10 @@ fn entry(red: u8, green: u8, blue: u8, render: Render) -> Entry {
             u16::from(render.lightness_floor) + u16::from(scale(above, render.lightness_gain));
         lifted.min(100) as u8
     };
+
+    // The floor is a choice about the room, not about the picture: some people
+    // want a backlight that never goes completely dark behind the television.
+    let lightness = lightness.max(render.minimum_lightness);
 
     (lightness, hsi.hue, saturation)
 }
@@ -298,12 +333,58 @@ mod tests {
     }
 
     #[test]
+    fn a_minimum_lightness_lifts_black_and_zero_leaves_it_black() {
+        // Somebody who does not want the room to go dark behind the television
+        // sets a base glow. It is off by default because a constant glow through
+        // a black film is what this feature exists to avoid.
+        let glowing = Render {
+            minimum_lightness: 25,
+            ..Render::default()
+        };
+        assert_eq!(
+            one([0, 0, 0], glowing).0,
+            25,
+            "black is lifted to the floor"
+        );
+        assert_eq!(
+            one([0, 0, 0], Render::default()).0,
+            0,
+            "and a floor of zero leaves it alone"
+        );
+    }
+
+    #[test]
+    fn a_maximum_brightness_is_a_ceiling_not_a_level() {
+        // It does not add light, it only bounds it: the picture still decides
+        // everything below the ceiling.
+        let dim = Render {
+            maximum_brightness: 40,
+            ..Render::default()
+        };
+        assert!(dim.is_sane());
+        assert_eq!(
+            one([255, 255, 255], dim).0,
+            100,
+            "per-segment light is untouched"
+        );
+        assert!(
+            !Render {
+                maximum_brightness: 101,
+                ..Render::default()
+            }
+            .is_sane(),
+            "over 100 percent is a mistake, not a setting"
+        );
+    }
+
+    #[test]
     fn a_gain_of_one_and_no_floor_leaves_hue_and_lightness_alone() {
         let neutral = Render {
             black_level: 0,
             saturation_gain: 1.0,
             lightness_gain: 1.0,
             lightness_floor: 0,
+            ..Render::default()
         };
         for rgb in [[98, 94, 69], [255, 128, 0], [12, 200, 40], [0, 0, 0]] {
             let hsi = rgb_to_hsi(rgb[0], rgb[1], rgb[2]);

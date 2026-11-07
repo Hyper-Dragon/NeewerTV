@@ -218,6 +218,10 @@ input[type=range]{width:8rem}
 <label>Colour gain <input id="satgain" type="number" min="1" max="8" step="0.1" value="2"></label>
 <label>Light gain <input id="lightgain" type="number" min="1" max="8" step="0.1" value="1.4"></label>
 </div>
+<div class="row">
+<label>Max brightness <input id="maxbright" type="number" min="0" max="100" step="1" value="100"></label>
+<label>Base glow <input id="minglow" type="number" min="0" max="100" step="1" value="0"></label>
+</div>
 <p class="hint">Click the four corners of the screen in order: top-left, top-right,
 bottom-right, bottom-left. Drag a handle to adjust it; right-click removes the last
 corner. The swatches below are drawn from the same numbers the twenty segments are
@@ -279,7 +283,8 @@ let depth = 0.10;
 let linear = true;
 // Kept so the tuning can be sent back whole: the page does not edit the floor, but
 // dropping it would silently reset it to the default on every save.
-let render = { black_level: 10, saturation_gain: 2, lightness_gain: 1.4, lightness_floor: 8 };
+let render = { black_level: 10, saturation_gain: 2, lightness_gain: 1.4, lightness_floor: 8,
+               maximum_brightness: 100, minimum_lightness: 0 };
 
 const numberFrom = (id, fallback) => {
   const value = parseFloat(document.getElementById(id).value);
@@ -489,6 +494,8 @@ async function saveCalibration() {
         saturation_gain: numberFrom('satgain', render.saturation_gain),
         lightness_gain: numberFrom('lightgain', render.lightness_gain),
         lightness_floor: render.lightness_floor,
+        maximum_brightness: numberFrom('maxbright', render.maximum_brightness),
+        minimum_lightness: numberFrom('minglow', render.minimum_lightness),
       },
     }),
   });
@@ -771,6 +778,8 @@ async function loadSaved() {
     document.getElementById('blacklevel').value = String(render.black_level);
     document.getElementById('satgain').value = String(render.saturation_gain);
     document.getElementById('lightgain').value = String(render.lightness_gain);
+    document.getElementById('maxbright').value = String(render.maximum_brightness);
+    document.getElementById('minglow').value = String(render.minimum_lightness);
     updateFields(Boolean(saved.white), Boolean(saved.black));
     const percent = Math.round(depth * 100);
     document.getElementById('depth').value = String(percent);

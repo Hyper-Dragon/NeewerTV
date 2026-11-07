@@ -164,12 +164,15 @@ fn spawn_ambient_bridge(
 
             // The user's brightness is a scale, not something the preview takes
             // over: twenty segments at full blast in a dark room is not what the
-            // slider is for.
+            // slider is for. The calibration can put a ceiling under it, so a
+            // backlight that should never light the room up stays that way even
+            // when somebody drags the slider to the top.
+            let ceiling = u32::from(reading.render.maximum_brightness.min(100)) * 10;
             let brightness = snapshot
                 .borrow()
                 .brightness
                 .map_or(1000, |level| (u32::from(level) * 1000 + 127) / 255)
-                as u16;
+                .min(ceiling) as u16;
 
             let entries = neewertv::ambient::render::entries(&reading.colours, reading.render);
 

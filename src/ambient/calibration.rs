@@ -345,6 +345,7 @@ mod tests {
             saturation_gain: 2.5,
             lightness_gain: 1.7,
             lightness_floor: 11,
+            ..Render::default()
         };
         calibration.black = Some([[0.02, 0.03, 0.04]; SEGMENTS]);
         calibration.white = Some([[0.9, 0.85, 0.8]; SEGMENTS]);
