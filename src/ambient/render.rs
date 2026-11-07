@@ -107,6 +107,24 @@ impl Default for Render {
     }
 }
 
+impl Render {
+    /// Every knob turned off: what the camera said, changed as little as the
+    /// firmware allows.
+    ///
+    /// Used by the calibration page's raw view. If the strip matches the picture
+    /// with this on and does not with it off, the transfer is the problem; if it
+    /// matches neither, the camera never saw the picture properly.
+    #[must_use]
+    pub fn identity() -> Self {
+        Self {
+            black_level: 0,
+            saturation_gain: 1.0,
+            lightness_gain: 1.0,
+            lightness_floor: 0,
+        }
+    }
+}
+
 /// Convert a whole reading into segment entries.
 pub fn entries(colours: &[[u8; 3]], render: Render) -> Vec<Entry> {
     colours

@@ -133,12 +133,21 @@ pub struct Sampler {
 impl Sampler {
     /// `None` when the calibration's corners do not define a usable quad.
     pub fn new(calibration: &super::Calibration) -> Option<Self> {
+        Self::new_with(calibration, true)
+    }
+
+    /// Build a sampler, optionally ignoring the measured flat field.
+    ///
+    /// Uncorrected is a diagnostic, not a mode: it is the only way to see what
+    /// the camera itself reports, and therefore the only way to tell a bad
+    /// calibration from a camera that cannot see the screen properly.
+    pub fn new_with(calibration: &super::Calibration, corrected: bool) -> Option<Self> {
         Some(Self {
             zones: super::geometry::zone_rects(calibration.aspect, calibration.depth),
             homography: calibration.homography()?,
             aspect: calibration.aspect,
             linear: calibration.linear,
-            correction: calibration.correction(),
+            correction: corrected.then(|| calibration.correction()).flatten(),
             smoothed: [[0.0; 3]; SEGMENTS],
             primed: false,
         })

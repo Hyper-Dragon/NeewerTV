@@ -20,7 +20,7 @@ pub mod render;
 pub mod sampling;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -177,6 +177,9 @@ pub struct Handle {
     path: PathBuf,
     viewing: Arc<Lease>,
     measuring: Arc<Lease>,
+    /// Bypass the flat field and the render transfer, for telling a camera that
+    /// cannot see from a correction that is wrong.
+    bypass: Arc<AtomicBool>,
     measure: mpsc::Sender<MeasureReply>,
     camera: Option<std::sync::mpsc::Sender<controls::CameraRequest>>,
 }
@@ -220,7 +223,6 @@ impl Handle {
     }
 
     /// Whether a flat field is being measured right now.
-    ///
     /// The strip goes dark for the duration. Nothing else in the daemon can
     /// arrange that: the thing being measured and the light that pollutes the
     /// measurement are the same fixture.
@@ -287,6 +289,21 @@ impl Handle {
             *slot = Some(Arc::new(calibration));
         }
         Ok(())
+    }
+
+    /// Whether the flat field is being bypassed right now.
+    pub fn bypassing(&self) -> bool {
+        self.bypass.load(Ordering::Relaxed)
+    }
+
+    /// Turn every correction off, or back on.
+    ///
+    /// This is the answer to "is it the camera or is it us". With it on the
+    /// strip is driven from the raw zone colours, so if the picture looks right
+    /// and the strip does not, the camera never saw the picture properly and no
+    /// calibration will fix it.
+    pub fn set_bypass(&self, off: bool) {
+        self.bypass.store(off, Ordering::Relaxed);
     }
 
     /// Every control the camera offers, with its current value.
@@ -434,6 +451,8 @@ pub fn start(
     let (camera_tx, camera_rx) = std::sync::mpsc::channel();
     camera::spawn(device, frames_tx, camera_rx, settings, shutdown.clone());
 
+    let bypass = Arc::new(AtomicBool::new(false));
+
     let calibration = Arc::new(RwLock::new(stored));
 
     tokio::spawn(sample_frames(
@@ -442,6 +461,7 @@ pub fn start(
         Arc::clone(&calibration),
         max_fps,
         measure_rx,
+        Arc::clone(&bypass),
         shutdown,
     ));
 
@@ -452,6 +472,7 @@ pub fn start(
         path: calibration_path,
         viewing: Arc::new(Lease::new()),
         measuring: Arc::new(Lease::new()),
+        bypass: Arc::clone(&bypass),
         measure: measure_tx,
         camera: Some(camera_tx),
     }
@@ -468,10 +489,11 @@ async fn sample_frames(
     calibration: Arc<RwLock<Option<Arc<Calibration>>>>,
     max_fps: u8,
     mut requests: mpsc::Receiver<MeasureReply>,
+    bypass: Arc<AtomicBool>,
     shutdown: CancellationToken,
 ) {
     let mut sampler: Option<Sampler> = None;
-    let mut sampler_for: Option<Arc<Calibration>> = None;
+    let mut sampler_for: Option<(Arc<Calibration>, bool)> = None;
     let mut window = FrameWindow::default();
 
     // A cap, not a rate: a frame that arrives early is dropped rather than
@@ -487,14 +509,19 @@ async fn sample_frames(
         // Done before the select so that a measurement request never meets a
         // sampler built from the calibration it is about to replace.
         let current = calibration.read().ok().and_then(|slot| slot.clone());
+        let bypassed = bypass.load(Ordering::Relaxed);
         let unchanged = match (&sampler_for, &current) {
-            (Some(previous), Some(next)) => Arc::ptr_eq(previous, next),
+            (Some((previous, previous_bypass)), Some(next)) => {
+                Arc::ptr_eq(previous, next) && *previous_bypass == bypassed
+            }
             (None, None) => true,
             _ => false,
         };
         if !unchanged {
-            sampler = current.as_ref().and_then(|next| Sampler::new(next));
-            sampler_for = current.clone();
+            sampler = current
+                .as_ref()
+                .and_then(|next| Sampler::new_with(next, !bypassed));
+            sampler_for = current.clone().map(|calibration| (calibration, bypassed));
         }
 
         // The measurement arm has to borrow the frame channel too, so the select
@@ -544,7 +571,15 @@ async fn sample_frames(
             clipped_zones: reading.clipped_zones,
             fps,
             calibrated: true,
-            render: current.map_or_else(Render::default, |calibration| calibration.render),
+            render: current
+                .as_ref()
+                .map_or_else(Render::default, |calibration| {
+                    if bypassed {
+                        Render::identity()
+                    } else {
+                        calibration.render
+                    }
+                }),
         })));
     }
 }

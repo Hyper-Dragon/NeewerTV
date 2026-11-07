@@ -48,6 +48,9 @@ pub const PATH_CALIBRATION: &str = "/api/calibration";
 pub const PATH_CALIBRATION_FIELD: &str = "/api/calibration/field";
 /// The camera's own controls: gain, exposure, white balance.
 pub const PATH_CAMERA: &str = "/api/camera";
+/// Turn every correction off, to tell a bad calibration from a camera that
+/// cannot see.
+pub const PATH_AMBIENT_BYPASS: &str = "/api/ambient/bypass";
 
 /// Boundary between the parts of the preview stream.
 const PREVIEW_BOUNDARY: &str = "neewertv-frame";
@@ -127,7 +130,8 @@ pub fn router(state: AppState) -> Router {
                 get(api_calibration).post(api_calibration_save),
             )
             .route(PATH_CALIBRATION_FIELD, post(api_calibration_field))
-            .route(PATH_CAMERA, get(api_camera).post(api_camera_set));
+            .route(PATH_CAMERA, get(api_camera).post(api_camera_set))
+            .route(PATH_AMBIENT_BYPASS, post(api_ambient_bypass));
     }
 
     router.with_state(state)
@@ -196,6 +200,7 @@ input[type=range]{width:8rem}
 <div class="row">
 <label>Depth <input id="depth" type="range" min="3" max="30" value="10"><span id="depthv">10%</span></label>
 <label><input id="linear" type="checkbox" checked> Linear light</label>
+<label><input id="bypass" type="checkbox"> Raw camera (no correction)</label>
 <button id="save" class="primary">Save calibration</button>
 <button id="png">Save PNG</button>
 </div>
@@ -208,6 +213,10 @@ input[type=range]{width:8rem}
 bottom-right, bottom-left. Drag a handle to adjust it; right-click removes the last
 corner. The swatches below are drawn from the same numbers the twenty segments are
 sent, so the gains above show up there as you change them.</p>
+<p class="hint"><strong>Raw camera</strong> skips the flat field and every gain: the strip
+then shows what the camera reported and nothing else. If the light looks right with it on
+and wrong with it off, the correction is at fault; if it is wrong both ways, the camera
+is not seeing the screen properly and no calibration will fix that.</p>
 </section>
 <section class="card"><h2>Flat field</h2>
 <div class="row">
@@ -409,6 +418,8 @@ async function refresh() {
         view.height = latest.frame.height;
       }
       const bits = [latest.fps.toFixed(1) + ' fps sampled'];
+      if (latest.bypass) bits.push('raw camera');
+      document.getElementById('bypass').checked = Boolean(latest.bypass);
       const strip = meterStrip(latest.strip);
       if (!latest.strip || !latest.strip.connected) {
         bits.push('strip not connected');
@@ -647,6 +658,16 @@ document.getElementById('linear').addEventListener('change', (event) => {
 });
 document.getElementById('save').addEventListener('click', saveCalibration);
 document.getElementById('png').addEventListener('click', savePng);
+document.getElementById('bypass').addEventListener('change', async (event) => {
+  await fetch('/api/ambient/bypass', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ on: event.target.checked }),
+  });
+  statusLine.textContent = event.target.checked
+    ? 'showing the raw camera, every correction off'
+    : 'corrections back on';
+});
 document.getElementById('white').addEventListener('click', () => measureField('white'));
 document.getElementById('black').addEventListener('click', () => measureField('black'));
 
@@ -854,6 +875,7 @@ async fn api_ambient(State(state): State<AppState>) -> Response {
 
     Json(json!({
         "calibrated": latest.calibrated,
+        "bypass": ambient.bypassing(),
         "frame": { "width": latest.frame.width, "height": latest.frame.height },
         "fps": latest.fps,
         "clipped_zones": latest.clipped_zones,
@@ -912,6 +934,24 @@ struct FieldRequest {
 struct CameraSetRequest {
     id: u32,
     value: i64,
+}
+
+/// Whether to stop correcting.
+#[derive(Debug, Deserialize)]
+struct BypassRequest {
+    on: bool,
+}
+
+/// Switch the flat field and the transfer off, or back on.
+async fn api_ambient_bypass(
+    State(state): State<AppState>,
+    Json(request): Json<BypassRequest>,
+) -> Response {
+    let Some(ambient) = state.ambient.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    ambient.set_bypass(request.on);
+    Json(json!({ "ok": true, "bypass": ambient.bypassing() })).into_response()
 }
 
 /// Everything the camera can be told, with what it is currently told.
