@@ -173,6 +173,23 @@ fn spawn_ambient_bridge(
 
             let entries = neewertv::ambient::render::entries(&reading.colours, reading.render);
 
+            // Recorded here rather than in the sampler, because this is the only
+            // place that holds both ends of the transfer at once: what the camera
+            // reported and the exact triple that goes down the wire.
+            let mut wire = [[0_u16; 3]; neewertv::ambient::SEGMENTS];
+            for (slot, entry) in wire.iter_mut().zip(entries.iter().copied()) {
+                let (lightness, hue, saturation) = entry;
+                *slot = [u16::from(lightness), hue, u16::from(saturation)];
+            }
+            ambient.record_frame(neewertv::ambient::RecordedFrame {
+                ms: 0,
+                colours: reading.colours,
+                entries: wire,
+                clipped_zones: reading.clipped_zones,
+                brightness,
+                fps: reading.fps,
+            });
+
             // Dropped rather than queued when the worker is behind: a colour from
             // two frames ago is worse than no colour, and the link is slower than
             // the camera by a wide margin.

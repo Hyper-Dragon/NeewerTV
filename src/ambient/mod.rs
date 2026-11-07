@@ -21,9 +21,10 @@ pub mod sampling;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -118,6 +119,32 @@ pub const INSET_HEIGHT: f32 = 0.72;
 /// Exponential moving average applied to each zone's output every frame.
 pub const SMOOTHING: f32 = 0.5;
 
+/// How many preview frames a diagnostic recording keeps.
+///
+/// Two minutes at the ten a second the link sustains: long enough to hold a
+/// measurement, a scene change and the strip's response to both, and small
+/// enough to paste into a message.
+pub const RECORD_LIMIT: usize = 1200;
+
+/// One frame of the pipeline as it was sent, for the diagnostic download.
+///
+/// Both ends of the transfer are kept: what the camera reported, and the exact
+/// triple that went down the wire. Anything in between can be recomputed from
+/// these two and the calibration that was in force.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordedFrame {
+    /// Milliseconds since the recording started.
+    pub ms: u64,
+    /// Zone colours as the sampler reported them, 0–255 per channel.
+    pub colours: [[u8; 3]; SEGMENTS],
+    /// Segment entries as sent: lightness, hue, saturation.
+    pub entries: [[u16; 3]; SEGMENTS],
+    /// Zones the sampler flagged as over-exposed.
+    pub clipped_zones: usize,
+    pub brightness: u16,
+    pub fps: f32,
+}
+
 /// Capture geometry asked of the camera.
 pub const CAPTURE_WIDTH: u32 = 640;
 pub const CAPTURE_HEIGHT: u32 = 480;
@@ -180,8 +207,30 @@ pub struct Handle {
     /// Bypass the flat field and the render transfer, for telling a camera that
     /// cannot see from a correction that is wrong.
     bypass: Arc<AtomicBool>,
+    /// Frames captured for the diagnostic download, and whether it is running.
+    recorder: Arc<Mutex<Recorder>>,
     measure: mpsc::Sender<MeasureReply>,
     camera: Option<std::sync::mpsc::Sender<controls::CameraRequest>>,
+}
+
+/// What the preview has been asked to remember.
+#[derive(Default)]
+struct Recorder {
+    since: Option<Instant>,
+    frames: Vec<RecordedFrame>,
+}
+
+impl Recorder {
+    fn push(&mut self, mut frame: RecordedFrame) {
+        let Some(since) = self.since else {
+            return;
+        };
+        if self.frames.len() >= RECORD_LIMIT {
+            return;
+        }
+        frame.ms = since.elapsed().as_millis() as u64;
+        self.frames.push(frame);
+    }
 }
 
 impl Handle {
@@ -289,6 +338,42 @@ impl Handle {
             *slot = Some(Arc::new(calibration));
         }
         Ok(())
+    }
+
+    /// Start or stop recording preview frames for the diagnostic download.
+    pub fn set_recording(&self, on: bool) {
+        if let Ok(mut recorder) = self.recorder.lock() {
+            recorder.since = on.then(Instant::now);
+            if !on {
+                // Left in place, so the download still has the last recording
+                // after the operator stops it.
+                return;
+            }
+            recorder.frames.clear();
+        }
+    }
+
+    /// Whether a recording is running, and how many frames it holds.
+    pub fn recording(&self) -> (bool, usize) {
+        self.recorder
+            .lock()
+            .map(|recorder| (recorder.since.is_some(), recorder.frames.len()))
+            .unwrap_or((false, 0))
+    }
+
+    /// Keep one frame, if a recording is running.
+    pub fn record_frame(&self, frame: RecordedFrame) {
+        if let Ok(mut recorder) = self.recorder.lock() {
+            recorder.push(frame);
+        }
+    }
+
+    /// Everything recorded so far.
+    pub fn recorded(&self) -> Vec<RecordedFrame> {
+        self.recorder
+            .lock()
+            .map(|recorder| recorder.frames.clone())
+            .unwrap_or_default()
     }
 
     /// Whether the flat field is being bypassed right now.
@@ -473,6 +558,7 @@ pub fn start(
         viewing: Arc::new(Lease::new()),
         measuring: Arc::new(Lease::new()),
         bypass: Arc::clone(&bypass),
+        recorder: Arc::new(Mutex::new(Recorder::default())),
         measure: measure_tx,
         camera: Some(camera_tx),
     }

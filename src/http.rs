@@ -51,6 +51,10 @@ pub const PATH_CAMERA: &str = "/api/camera";
 /// Turn every correction off, to tell a bad calibration from a camera that
 /// cannot see.
 pub const PATH_AMBIENT_BYPASS: &str = "/api/ambient/bypass";
+/// Everything needed to explain a calibration from somewhere else.
+pub const PATH_DIAGNOSTIC: &str = "/api/diagnostic";
+/// Start or stop capturing frames into that bundle.
+pub const PATH_DIAGNOSTIC_RECORD: &str = "/api/diagnostic/record";
 
 /// Boundary between the parts of the preview stream.
 const PREVIEW_BOUNDARY: &str = "neewertv-frame";
@@ -131,7 +135,9 @@ pub fn router(state: AppState) -> Router {
             )
             .route(PATH_CALIBRATION_FIELD, post(api_calibration_field))
             .route(PATH_CAMERA, get(api_camera).post(api_camera_set))
-            .route(PATH_AMBIENT_BYPASS, post(api_ambient_bypass));
+            .route(PATH_AMBIENT_BYPASS, post(api_ambient_bypass))
+            .route(PATH_DIAGNOSTIC, get(api_diagnostic))
+            .route(PATH_DIAGNOSTIC_RECORD, post(api_diagnostic_record));
     }
 
     router.with_state(state)
@@ -239,6 +245,17 @@ cameras. Turn <em>Auto Exposure</em> off before setting <em>Exposure, Absolute</
 set <em>Power Line Frequency</em> to the rate your lighting runs at or the sampling can
 pick up banding. Everything here is stored with the calibration and applied when the
 device opens.</p>
+</section>
+<section class="card"><h2>Diagnostics</h2>
+<div class="row">
+<span class="hint" id="recstate">not recording</span>
+<button id="record">Record</button>
+<button id="download" class="primary">Download diagnostic</button>
+</div>
+<p class="hint">Record captures what the camera reported and the exact numbers sent to
+the strip, ten times a second, for up to two minutes. Download bundles that with the
+calibration, the camera settings, the link state and the log into one file. Nothing in
+it identifies anything beyond this light.</p>
 </section>
 <section class="card"><h2>Segment colours</h2><div id="swatches" class="swatches"></div></section>
 </main>
@@ -420,6 +437,9 @@ async function refresh() {
       const bits = [latest.fps.toFixed(1) + ' fps sampled'];
       if (latest.bypass) bits.push('raw camera');
       document.getElementById('bypass').checked = Boolean(latest.bypass);
+      if (latest.recording && latest.recording.running) {
+        recordState.textContent = 'recording\u2026 ' + latest.recording.frames + ' frames';
+      }
       const strip = meterStrip(latest.strip);
       if (!latest.strip || !latest.strip.connected) {
         bits.push('strip not connected');
@@ -574,6 +594,41 @@ async function loadCamera() {
   }
 }
 
+const recordButton = document.getElementById('record');
+const recordState = document.getElementById('recstate');
+let recording = false;
+
+async function setRecording(on) {
+  const res = await fetch('/api/diagnostic/record', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ on }),
+  });
+  const body = await res.json().catch(() => ({}));
+  recording = Boolean(body.recording);
+  recordButton.textContent = recording ? 'Stop' : 'Record';
+  recordButton.classList.toggle('primary', recording);
+  recordState.textContent = recording ? 'recording\u2026' : (body.frames || 0) + ' frames captured';
+}
+
+async function downloadDiagnostic() {
+  statusLine.textContent = 'collecting\u2026';
+  const res = await fetch('/api/diagnostic');
+  if (!res.ok) {
+    statusLine.textContent = 'could not collect the diagnostic: ' + res.status;
+    return;
+  }
+  const text = await res.text();
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const blob = new Blob([text], { type: 'application/json' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = 'neewertv-diagnostic-' + stamp + '.json';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 10000);
+  statusLine.textContent = 'diagnostic downloaded (' + Math.round(text.length / 1024) + ' KB)';
+}
+
 async function measureField(field) {
   statusLine.textContent = 'measuring the ' + field + ' field\u2026';
   const res = await fetch('/api/calibration/field', {
@@ -658,6 +713,8 @@ document.getElementById('linear').addEventListener('change', (event) => {
 });
 document.getElementById('save').addEventListener('click', saveCalibration);
 document.getElementById('png').addEventListener('click', savePng);
+recordButton.addEventListener('click', () => setRecording(!recording));
+document.getElementById('download').addEventListener('click', downloadDiagnostic);
 document.getElementById('bypass').addEventListener('change', async (event) => {
   await fetch('/api/ambient/bypass', {
     method: 'POST',
@@ -876,6 +933,10 @@ async fn api_ambient(State(state): State<AppState>) -> Response {
     Json(json!({
         "calibrated": latest.calibrated,
         "bypass": ambient.bypassing(),
+        "recording": {
+            "running": ambient.recording().0,
+            "frames": ambient.recording().1,
+        },
         "frame": { "width": latest.frame.width, "height": latest.frame.height },
         "fps": latest.fps,
         "clipped_zones": latest.clipped_zones,
@@ -952,6 +1013,83 @@ async fn api_ambient_bypass(
     };
     ambient.set_bypass(request.on);
     Json(json!({ "ok": true, "bypass": ambient.bypassing() })).into_response()
+}
+
+/// Start or stop capturing preview frames into the diagnostic bundle.
+async fn api_diagnostic_record(
+    State(state): State<AppState>,
+    Json(request): Json<BypassRequest>,
+) -> Response {
+    let Some(ambient) = state.ambient.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    ambient.set_recording(request.on);
+    let (recording, frames) = ambient.recording();
+    Json(json!({ "ok": true, "recording": recording, "frames": frames })).into_response()
+}
+
+/// Everything needed to explain what the pipeline did, in one file.
+///
+/// Seconds since the epoch.
+///
+/// Deliberately not a formatted date: the browser knows what time it is, and a
+/// daemon that formats dates would need a calendar crate to get it wrong.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Deliberately one JSON document rather than an archive: it is meant to be
+/// attached to a message and read, and a zip of four files is more work for both
+/// ends than a single object.
+async fn api_diagnostic(State(state): State<AppState>) -> Response {
+    let snapshot = state.snapshot.borrow().clone();
+    let Some(ambient) = state.ambient.as_ref() else {
+        return Json(json!({
+            "generated_unix": now_unix(),
+            "device": state.device_name,
+            "ambient": Value::Null,
+            "note": "ambient capture is off for this deployment",
+        }))
+        .into_response();
+    };
+
+    let (recording, frames) = ambient.recording();
+    let controls = ambient.camera_controls().await.unwrap_or_default();
+
+    Json(json!({
+        "generated_unix": now_unix(),
+        "device": state.device_name,
+        "version": env!("CARGO_PKG_VERSION"),
+        "link": {
+            "connected": snapshot.connected,
+            "address": snapshot.address,
+            "preview": snapshot.preview,
+            "writes_sent": snapshot.writes_sent,
+            "frames_skipped": snapshot.frames_skipped,
+            "commands_received": snapshot.commands_received,
+            "drops": snapshot.drops,
+            "last_error": snapshot.last_error,
+            "on": snapshot.on,
+            "brightness": snapshot.brightness,
+        },
+        "calibration": ambient.calibration().map(|stored| (*stored).clone()),
+        "bypass": ambient.bypassing(),
+        "recording": { "running": recording, "frames": frames },
+        "camera": controls,
+        "samples": ambient.recorded(),
+        "latest": ambient.latest().map(|latest| json!({
+            "frame": { "width": latest.frame.width, "height": latest.frame.height },
+            "fps": latest.fps,
+            "calibrated": latest.calibrated,
+            "clipped_zones": latest.clipped_zones,
+            "colours": latest.colours,
+            "render": latest.render,
+        })),
+        "logs": state.logs.snapshot(),
+    }))
+    .into_response()
 }
 
 /// Everything the camera can be told, with what it is currently told.
