@@ -46,6 +46,8 @@ pub const PATH_AMBIENT: &str = "/api/ambient";
 pub const PATH_CALIBRATION: &str = "/api/calibration";
 /// Measure the white or black field that is on screen right now.
 pub const PATH_CALIBRATION_FIELD: &str = "/api/calibration/field";
+/// Set the camera up from the white field, then measure it.
+pub const PATH_CALIBRATION_AUTO: &str = "/api/calibration/auto";
 /// The camera's own controls: gain, exposure, white balance.
 pub const PATH_CAMERA: &str = "/api/camera";
 /// Turn every correction off, to tell a bad calibration from a camera that
@@ -134,6 +136,7 @@ pub fn router(state: AppState) -> Router {
                 get(api_calibration).post(api_calibration_save),
             )
             .route(PATH_CALIBRATION_FIELD, post(api_calibration_field))
+            .route(PATH_CALIBRATION_AUTO, post(api_calibration_auto))
             .route(PATH_CAMERA, get(api_camera).post(api_camera_set))
             .route(PATH_AMBIENT_BYPASS, post(api_ambient_bypass))
             .route(PATH_DIAGNOSTIC, get(api_diagnostic))
@@ -227,14 +230,15 @@ is not seeing the screen properly and no calibration will fix that.</p>
 <section class="card"><h2>Flat field</h2>
 <div class="row">
 <span class="hint" id="fields">nothing measured</span>
+<button id="auto" class="primary">Auto-calibrate camera</button>
 <button id="white">Measure white</button>
 <button id="black">Measure black</button>
 </div>
-<p class="hint">Fill the screen with the white field and measure: every zone sees the same
-colour, so whatever differs between them is the camera &mdash; lens shading, angle,
-distance, the light in the room. Do the same with the black field to find the floor the
-camera reports with nothing on screen. Either one can be measured on its own, and both
-are saved into the calibration.</p>
+<p class="hint">Put the white field up and press <strong>Auto-calibrate camera</strong>. It pins
+the white balance, steps the exposure until the white field lands in a usable window, and
+stores both — so the screen's colour reaches the strip instead of being cancelled out, and
+the white is bright without being blown. Then put the black field up and press Measure
+black. Either field can also be measured by hand.</p>
 </section>
 <section class="card"><h2>Camera</h2>
 <div id="camera" class="controls"><span class="hint">reading the camera&hellip;</span></div>
@@ -629,6 +633,31 @@ async function downloadDiagnostic() {
   statusLine.textContent = 'diagnostic downloaded (' + Math.round(text.length / 1024) + ' KB)';
 }
 
+async function autoCalibrate() {
+  statusLine.textContent = 'setting the camera up from the white field \u2014 this takes a few seconds\u2026';
+  const res = await fetch('/api/calibration/auto', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    statusLine.textContent = 'auto-calibration failed: ' + (body.error || res.status);
+    return;
+  }
+  const percent = (v) => (typeof v === 'number' ? (v * 100).toFixed(0) + '%' : '?');
+  if (body.reached) {
+    statusLine.textContent = 'camera set up: white at ' + percent(body.brightness) +
+      ', exposure ' + body.exposure + ' \u00b7 white field stored';
+  } else {
+    statusLine.textContent = 'white settled at ' + percent(body.brightness) +
+      ' with ' + percent(body.clipped) + ' clipped \u2014 ' +
+      (body.steps || []).slice(-1)[0];
+  }
+  loadSaved();
+  loadCamera();
+}
+
 async function measureField(field) {
   statusLine.textContent = 'measuring the ' + field + ' field\u2026';
   const res = await fetch('/api/calibration/field', {
@@ -727,6 +756,7 @@ document.getElementById('bypass').addEventListener('change', async (event) => {
 });
 document.getElementById('white').addEventListener('click', () => measureField('white'));
 document.getElementById('black').addEventListener('click', () => measureField('black'));
+document.getElementById('auto').addEventListener('click', autoCalibrate);
 
 async function loadSaved() {
   try {
@@ -1361,9 +1391,9 @@ async fn api_calibration_field(
     let flat =
         (field == "white" && dimmest > 0.0 && brightest < dimmest * SUSPICIOUSLY_FLAT).then(|| {
             format!(
-                "every zone read {:.0}%, so this is not a picture of a camera — the white \
-                 field was clipped or the screen was not white, and the flattening half of \
-                 the correction will do nothing",
+                "every zone read {:.0}%, so there is nothing to flatten — many cameras correct \
+                 their own shading in firmware, and this one does. The white field is stored, \
+                 but it will cancel nothing; the black field is doing the work",
                 brightest * 100.0
             )
         });
@@ -1395,6 +1425,216 @@ async fn api_calibration_field(
         )
             .into_response(),
     }
+}
+
+/// Where a properly exposed white field should land, in linear light.
+///
+/// High enough to use the sensor's range, low enough that a highlight in the
+/// picture does not clip. 0.75 is about sRGB 225.
+const WHITE_TARGET: f32 = 0.75;
+/// Below this the field is under-exposed and the search opens up.
+const WHITE_LOW: f32 = 0.50;
+/// Above this it is close enough to clipping that a brighter frame would break.
+const WHITE_HIGH: f32 = 0.90;
+
+/// Control names this relies on.
+///
+/// V4L2 names its own controls, and every driver for a UVC camera uses these
+/// strings. Matching on the name rather than the id keeps it working across
+/// cameras whose ids differ, at the cost of falling back gracefully when a name
+/// is missing.
+const NAME_EXPOSURE: &str = "exposure time, absolute";
+const NAME_GAIN: &str = "gain";
+const NAME_AUTO_EXPOSURE: &str = "auto exposure";
+const NAME_AUTO_WHITE_BALANCE: &str = "white balance, automatic";
+const NAME_WHITE_BALANCE: &str = "white balance temperature";
+
+/// How many measure-and-adjust rounds the search takes before giving up.
+const AUTO_STEPS: usize = 6;
+
+/// Point the camera at the white field and set it up from the reading.
+///
+/// The point of this is that a camera left alone cannot be trusted: it hunts the
+/// scene, its white balance chases whatever colour is on screen, and its exposure
+/// is a guess. The operator can fix all three by hand, which is what the sliders
+/// are for — but the measurement itself is the better authority. It steps the
+/// exposure until the field lands in a usable window, pins the white balance so
+/// the screen's colour reaches the strip, and then takes the white field.
+async fn api_calibration_auto(State(state): State<AppState>) -> Response {
+    let Some(ambient) = state.ambient.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(stored) = ambient.calibration() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "set the four corners before calibrating the camera" })),
+        )
+            .into_response();
+    };
+
+    let controls = match ambient.camera_controls().await {
+        Ok(controls) => controls,
+        Err(err) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let find = |needle: &str| {
+        controls
+            .iter()
+            .find(|control| control.name.to_lowercase().contains(needle))
+    };
+
+    let mut steps: Vec<String> = Vec::new();
+
+    // White balance first: left automatic it chases the screen's own colour and
+    // cancels it out, so the strip is told the picture is grey. A fixed daylight
+    // temperature is the neutral choice for a screen.
+    if let Some(auto) = find(NAME_AUTO_WHITE_BALANCE)
+        && auto.value != 0
+    {
+        if let Err(err) = ambient.set_camera_control(auto.id, 0).await {
+            steps.push(format!("white balance could not be pinned: {err}"));
+        } else {
+            steps.push("white balance pinned".to_owned());
+        }
+    }
+    if let Some(wb) = find(NAME_WHITE_BALANCE)
+        && !wb.read_only
+        && wb.value != 6500
+        && (wb.minimum..=wb.maximum).contains(&6500)
+    {
+        let _ = ambient.set_camera_control(wb.id, 6500).await;
+        steps.push("white balance set to 6500K".to_owned());
+    }
+
+    // Exposure has to be manual before it can be stepped.
+    if let Some(auto) = find(NAME_AUTO_EXPOSURE)
+        && auto.kind == "menu"
+    {
+        let manual = auto
+            .items
+            .iter()
+            .find(|(_, label)| label.to_lowercase().contains("manual"))
+            .map(|(value, _)| i64::from(*value));
+        if let Some(manual) = manual
+            && auto.value != manual
+        {
+            let _ = ambient.set_camera_control(auto.id, manual).await;
+            steps.push("exposure set to manual".to_owned());
+        }
+    }
+
+    let Some(exposure) = find(NAME_EXPOSURE) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "this camera has no absolute exposure control, so it cannot be \
+                          set up automatically",
+                "steps": steps,
+            })),
+        )
+            .into_response();
+    };
+
+    let mut value = exposure.value;
+    let mut brightest = 0.0_f32;
+    let mut clipped = 0.0_f32;
+    let mut reached = false;
+    let mut accepted: Option<[[f32; 3]; ambient::SEGMENTS]> = None;
+
+    for _ in 0..AUTO_STEPS {
+        // The strip is switched off for the measurement, exactly as a manual one
+        // is: the light that would otherwise land on the screen is its own.
+        let measurement = match ambient.measure().await {
+            Ok(measurement) => measurement,
+            Err(err) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": err.to_string(), "steps": steps })),
+                )
+                    .into_response();
+            }
+        };
+        brightest = measurement.brightest();
+        clipped = measurement.worst_clip();
+
+        if clipped <= 0.02 && (WHITE_LOW..=WHITE_HIGH).contains(&brightest) {
+            reached = true;
+            accepted = Some(measurement.linear);
+            break;
+        }
+
+        // Exposure is close to linear in brightness, so the ratio is the step.
+        let ratio = if brightest > 0.01 {
+            WHITE_TARGET / brightest
+        } else {
+            2.0
+        };
+        let next = (value as f32 * ratio.clamp(0.3, 3.0)).round() as i64;
+        let next = next.max(exposure.minimum.max(1));
+
+        if next == value {
+            // The control will not move any further. Gain is the lever left, and
+            // it costs noise — which is why it is second.
+            if let Some(gain) = find(NAME_GAIN) {
+                let wanted = (gain.value as f32 * ratio.clamp(1.0, 3.0)).round() as i64;
+                let wanted = wanted.clamp(gain.minimum, gain.maximum.max(gain.minimum));
+                if wanted != gain.value {
+                    let _ = ambient.set_camera_control(gain.id, wanted).await;
+                    steps.push(format!("exposure is at its limit; gain raised to {wanted}"));
+                    continue;
+                }
+            }
+            steps.push("the camera will not go any brighter".to_owned());
+            break;
+        }
+
+        if let Err(err) = ambient.set_camera_control(exposure.id, next).await {
+            steps.push(format!("exposure could not be set: {err}"));
+            break;
+        }
+        steps.push(format!("exposure {value} -> {next}"));
+        value = next;
+    }
+
+    let mut calibration = (*stored).clone();
+    let stored_white = accepted.is_some();
+    if let Some(linear) = accepted {
+        calibration.white = Some(linear);
+    }
+
+    // The camera this calibration describes is whatever the search settled on, so
+    // it is written with it. A restart then comes back to the same instrument
+    // rather than to whatever the camera decided today.
+    if let Ok(controls) = ambient.camera_controls().await {
+        calibration.camera = controls
+            .iter()
+            .filter(|control| !control.read_only && !control.inactive)
+            .map(|control| ambient::CameraSetting {
+                id: control.id,
+                value: control.value,
+            })
+            .collect();
+    }
+    if stored_white {
+        let _ = ambient.save(calibration);
+    }
+
+    Json(json!({
+        "ok": true,
+        "reached": reached,
+        "white_stored": stored_white,
+        "brightness": brightest,
+        "clipped": clipped,
+        "exposure": value,
+        "target": WHITE_TARGET,
+        "steps": steps,
+    }))
+    .into_response()
 }
 
 /// The calibration page.
