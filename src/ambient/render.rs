@@ -35,6 +35,14 @@ pub const MAX_BLACK_LEVEL: u8 = 64;
 /// Gains beyond this are almost certainly a mistake rather than a setting.
 pub const MAX_GAIN: f32 = 8.0;
 
+/// A zone is allowed its full saturation from this lightness up.
+///
+/// Below it the allowance falls away quadratically, because what sits there is
+/// the camera's noise floor rather than a colour. 45 is above the firmware's own
+/// dead zone (about L=20), so a zone dim enough to be dark is also a zone that
+/// carries no colour.
+pub const FULL_COLOUR_LIGHTNESS: u8 = 45;
+
 /// How a reading is pushed towards what the firmware renders well.
 ///
 /// Part of the calibration file, not the environment: every one of these is a
@@ -114,7 +122,15 @@ fn entry(red: u8, green: u8, blue: u8, render: Render) -> Entry {
         black_point(blue, render.black_level),
     );
 
+    // A dark zone has a hue, and it is the hue of camera noise. Multiplying that
+    // by the saturation gain is what turns a black screen into a rainbow: three
+    // channels a few levels apart describe a fully saturated direction, and the
+    // strip renders it at whatever lightness the zone has. So the colour a zone
+    // is allowed to have scales with how lit it is — nothing at black, all of it
+    // by the time the zone is properly bright.
     let saturation = scale(u16::from(hsi.saturation), render.saturation_gain);
+    let saturation = u16::from(saturation) * u16::from(colour_allowed(hsi.lightness)) / 100;
+    let saturation = saturation as u8;
 
     let lightness = if hsi.lightness <= render.lightness_floor {
         hsi.lightness
@@ -126,6 +142,16 @@ fn entry(red: u8, green: u8, blue: u8, render: Render) -> Entry {
     };
 
     (lightness, hsi.hue, saturation)
+}
+
+/// How much of its saturation a zone at this lightness is allowed, 0–100.
+///
+/// Squared rather than linear: the noise band just above black has to be
+/// suppressed hard, while a zone that is merely dim keeps its colour.
+fn colour_allowed(lightness: u8) -> u8 {
+    let full = u32::from(FULL_COLOUR_LIGHTNESS);
+    let lit = u32::from(lightness).min(full);
+    (lit * lit * 100 / (full * full)) as u8
 }
 
 /// Reset the black point: at or below `black` is zero, and the rest is stretched
@@ -204,17 +230,39 @@ mod tests {
     }
 
     #[test]
-    fn a_dark_zone_is_lifted_out_of_the_dead_zone_and_its_colour_restored() {
+    fn a_dark_zone_keeps_its_colour_but_is_not_given_a_bright_one() {
         // The sample from the field report: a dim olive that the firmware
-        // rendered as near-white.
+        // rendered as near-white. The colour comes back, but not at the full
+        // multiplier: at a lightness of 38 the zone is dim enough that a fully
+        // saturated colour reads as a glow rather than as part of a picture.
         let rgb = [98, 94, 69];
         let (lightness, hue, saturation) = one(rgb, lifting());
 
         // Hue is never touched. What the camera saw is what gets described, and
         // only the two components the firmware renders badly are rescaled.
         assert_eq!(hue, rgb_to_hsi(rgb[0], rgb[1], rgb[2]).hue);
-        assert_eq!(saturation, 60, "30 becomes 60");
+        assert!(
+            saturation > 30,
+            "the lift restores colour, got {saturation}"
+        );
+        assert!(saturation < 60, "but stops short of the full multiplier");
         assert_eq!(lightness, 50, "38 is lifted to 50");
+    }
+
+    #[test]
+    fn a_nearly_black_zone_is_given_no_colour_at_all() {
+        // What a black screen actually measures: three channels a few levels
+        // apart, so the hue is the hue of noise. Boosted by the saturation gain
+        // and rendered at the zone's lightness, that is exactly the defect this
+        // whole feature exists to avoid — a rainbow in a dark room.
+        for noise in [[22, 19, 26], [18, 24, 20], [30, 22, 22]] {
+            let (lightness, _, saturation) = one(noise, lifting());
+            assert!(lightness > 0, "the zone keeps the lightness it measured");
+            assert!(
+                saturation <= 10,
+                "{noise:?} must not become a colour, got saturation {saturation}"
+            );
+        }
     }
 
     #[test]
@@ -232,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn a_gain_of_one_and_no_floor_is_the_identity() {
+    fn a_gain_of_one_and_no_floor_leaves_hue_and_lightness_alone() {
         let neutral = Render {
             black_level: 0,
             saturation_gain: 1.0,
@@ -241,7 +289,11 @@ mod tests {
         };
         for rgb in [[98, 94, 69], [255, 128, 0], [12, 200, 40], [0, 0, 0]] {
             let hsi = rgb_to_hsi(rgb[0], rgb[1], rgb[2]);
-            assert_eq!(one(rgb, neutral), (hsi.lightness, hsi.hue, hsi.saturation));
+            let (lightness, hue, _) = one(rgb, neutral);
+            // Saturation is not part of this promise: a dark zone is held back
+            // whatever the tuning says, because that rule is about noise rather
+            // than about taste.
+            assert_eq!((lightness, hue), (hsi.lightness, hsi.hue));
         }
     }
 }

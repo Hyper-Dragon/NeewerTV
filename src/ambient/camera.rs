@@ -269,7 +269,8 @@ fn capture(
                     let _ = reply.send(list_controls(&device));
                 }
                 CameraRequest::Set { id, value, reply } => {
-                    let _ = reply.send(set_control(&device, id, value).map_err(|err| err.to_string()));
+                    let _ =
+                        reply.send(set_control(&device, id, value).map_err(|err| err.to_string()));
                 }
                 CameraRequest::Quiet { id, value } => {
                     let _ = set_control(&device, id, value);

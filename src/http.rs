@@ -572,10 +572,14 @@ async function measureField(field) {
     return;
   }
   let line = field + ' field measured';
+  let detail = [];
   if (field === 'white' && typeof body.spread === 'number') {
-    line += ' \u00b7 zones differed by ' + Math.round(body.spread * 100) + '%';
+    detail.push('zones differed by ' + Math.round(body.spread * 100) + '%');
   }
-  statusLine.textContent = line;
+  if (field === 'black' && typeof body.level === 'number') {
+    detail.push('floor ' + (body.level * 100).toFixed(2) + '%');
+  }
+  statusLine.textContent = body.warning || (detail.length ? line + ' \u00b7 ' + detail.join(' \u00b7 ') : line);
   loadSaved();
 }
 
@@ -1045,6 +1049,14 @@ async fn api_calibration_save(
 /// A black field brighter than this, in linear light, is not a black field.
 const MAX_BLACK_FIELD: f32 = 0.25;
 
+/// Above this a "black" field is being displayed as something other than black.
+///
+/// 1 % in linear light is well above any panel's own black and well above the
+/// camera's noise floor, so reaching it means the screen is genuinely lit: a grey
+/// black field, which is what a studio-range video does on a player that reads it
+/// as full range.
+const LIFTED_BLACK: f32 = 0.01;
+
 /// Measure the flat field the operator is holding on screen.
 ///
 /// White is what turns the camera into an instrument: every zone sees the same
@@ -1089,6 +1101,7 @@ async fn api_calibration_field(
     };
 
     let mut calibration = (*stored).clone();
+    let brightest = measurement.brightest();
 
     if field == "white" {
         // A clipped sample is a value that was cut off before it was measured, so
@@ -1128,10 +1141,22 @@ async fn api_calibration_field(
         }
         calibration.black = Some(measurement.linear);
     }
-
     let spread = calibration
         .correction()
         .map(|correction| correction.spread());
+
+    // A black field that measured well above the panel's floor is the one thing
+    // that quietly poisons the whole calibration: the correction then subtracts a
+    // number that is mostly the screen being grey. It is still stored — refusing
+    // would leave the operator with no black field at all — but it is said out
+    // loud, because nothing else in the pipeline can tell.
+    let lifted = (field == "black" && brightest > LIFTED_BLACK).then(|| {
+        format!(
+            "the black field measured {:.1}% bright, so the screen is not showing black — \
+             check the player's RGB range before trusting this",
+            brightest * 100.0
+        )
+    });
 
     match ambient.save(calibration) {
         Ok(()) => Json(json!({
@@ -1147,6 +1172,10 @@ async fn api_calibration_field(
             // the mean. Large numbers mean the correction is doing real work; a
             // number near zero means the camera was already even.
             "spread": spread,
+            // What the brightest zone saw, in linear light. The number the black
+            // field exists to establish.
+            "level": brightest,
+            "warning": lifted,
         }))
         .into_response(),
         Err(err) => (

@@ -51,6 +51,12 @@ pub const MEASURE_FRAMES: usize = 20;
 /// The channel a measurement request travels on.
 type MeasureReply = oneshot::Sender<anyhow::Result<Measurement>>;
 
+/// How long a measurement waits after the strip is told to go dark.
+///
+/// One BLE write plus a frame or two of camera time is all the hardware needs;
+/// the rest is the panel and the room settling, which is slower than either.
+const MEASURE_SETTLE: Duration = Duration::from_millis(600);
+
 /// How long a measurement waits for one camera frame before giving up.
 const MEASURE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -169,7 +175,8 @@ pub struct Handle {
     frames: watch::Receiver<Option<Arc<Frame>>>,
     calibration: Arc<RwLock<Option<Arc<Calibration>>>>,
     path: PathBuf,
-    viewing: Arc<Viewing>,
+    viewing: Arc<Lease>,
+    measuring: Arc<Lease>,
     measure: mpsc::Sender<MeasureReply>,
     camera: Option<std::sync::mpsc::Sender<controls::CameraRequest>>,
 }
@@ -208,7 +215,25 @@ impl Handle {
             let _ = self.viewing.change.send(true);
         }
         ViewGuard {
-            viewing: Arc::clone(&self.viewing),
+            holding: Arc::clone(&self.viewing),
+        }
+    }
+
+    /// Whether a flat field is being measured right now.
+    ///
+    /// The strip goes dark for the duration. Nothing else in the daemon can
+    /// arrange that: the thing being measured and the light that pollutes the
+    /// measurement are the same fixture.
+    pub fn measuring(&self) -> watch::Receiver<bool> {
+        self.measuring.change.subscribe()
+    }
+
+    fn begin_measuring(&self) -> MeasureGuard {
+        if self.measuring.open_one() {
+            let _ = self.measuring.change.send(true);
+        }
+        MeasureGuard {
+            holding: Arc::clone(&self.measuring),
         }
     }
 
@@ -222,6 +247,18 @@ impl Handle {
     /// Goes through the sampling task rather than reading the frame channel here,
     /// because that task already owns the geometry and sees every frame.
     pub async fn measure(&self) -> anyhow::Result<Measurement> {
+        // Taken for the whole call, including the settle: the strip has to be off
+        // before the first frame is read, or the first frames describe a screen
+        // lit by the light that is about to be switched off.
+        let dark = self.begin_measuring();
+        tokio::time::sleep(MEASURE_SETTLE).await;
+
+        let answer = self.measure_now().await;
+        drop(dark);
+        answer
+    }
+
+    async fn measure_now(&self) -> anyhow::Result<Measurement> {
         let (reply, answer) = oneshot::channel();
         self.measure
             .send(reply)
@@ -283,13 +320,21 @@ impl Handle {
 }
 
 /// How many preview streams are open, and a channel that says whether any are.
-struct Viewing {
+struct Lease {
     open: AtomicUsize,
     change: watch::Sender<bool>,
 }
 
-impl Viewing {
-    /// Returns true when this was the first viewer.
+impl Lease {
+    fn new() -> Self {
+        let (change, _) = watch::channel(false);
+        Self {
+            open: AtomicUsize::new(0),
+            change,
+        }
+    }
+
+    /// Returns true when this was the first holder.
     fn open_one(&self) -> bool {
         self.open.fetch_add(1, Ordering::SeqCst) == 0
     }
@@ -298,18 +343,40 @@ impl Viewing {
     fn close_one(&self) -> bool {
         self.open.fetch_sub(1, Ordering::SeqCst) == 1
     }
+
+    fn release(&self) {
+        if self.close_one() {
+            let _ = self.change.send(false);
+        }
+    }
 }
 
 /// Keeps a preview lease alive for as long as it is held.
 pub struct ViewGuard {
-    viewing: Arc<Viewing>,
+    holding: Arc<Lease>,
 }
 
 impl Drop for ViewGuard {
     fn drop(&mut self) {
-        if self.viewing.close_one() {
-            let _ = self.viewing.change.send(false);
-        }
+        self.holding.release();
+    }
+}
+
+/// Keeps the strip dark for as long as a field is being measured.
+///
+/// A flat field is a measurement of the screen, and the strip is a light source
+/// aimed at the same room. Measuring the white field while the strip is showing
+/// white floods the room, which lands in every zone as an uneven haze; measuring
+/// the black field while it is showing a colour reads the light the strip is
+/// throwing at the screen rather than the panel's own black. Neither is a
+/// property of the camera, and both get baked into the correction.
+pub struct MeasureGuard {
+    holding: Arc<Lease>,
+}
+
+impl Drop for MeasureGuard {
+    fn drop(&mut self) {
+        self.holding.release();
     }
 }
 
@@ -355,7 +422,6 @@ pub fn start(
 
     let (frames_tx, frames_rx) = watch::channel(None);
     let (latest_tx, latest_rx) = watch::channel(None);
-    let (change, _) = watch::channel(false);
     let (measure_tx, measure_rx) = mpsc::channel(1);
 
     // The camera thread owns the device, so its settings travel to it rather than
@@ -384,10 +450,8 @@ pub fn start(
         frames: frames_rx,
         calibration,
         path: calibration_path,
-        viewing: Arc::new(Viewing {
-            open: AtomicUsize::new(0),
-            change,
-        }),
+        viewing: Arc::new(Lease::new()),
+        measuring: Arc::new(Lease::new()),
         measure: measure_tx,
         camera: Some(camera_tx),
     }

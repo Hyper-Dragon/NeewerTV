@@ -63,12 +63,19 @@ fn spawn_ambient_bridge(
 ) {
     tokio::spawn(async move {
         let mut watching = ambient.watching();
+        let mut measuring = ambient.measuring();
         let mut latest = ambient.latest_changes();
         let mut previewing = false;
+        let mut measuring_now = false;
 
         loop {
             tokio::select! {
                 changed = watching.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                changed = measuring.changed() => {
                     if changed.is_err() {
                         break;
                     }
@@ -80,10 +87,28 @@ fn spawn_ambient_bridge(
                 }
             }
 
+            // A flat field is measured with the strip dark: the light that would
+            // otherwise land on the screen is the strip's own, and it would be
+            // read as part of the screen. The preview is suspended rather than
+            // stopped, so it keeps the restore point it captured.
+            let now_measuring = *measuring.borrow_and_update();
+            if previewing && now_measuring != measuring_now {
+                let message = if now_measuring {
+                    Message::AmbientSuspend
+                } else {
+                    Message::AmbientResume
+                };
+                if commands.send(message).await.is_err() {
+                    break;
+                }
+            }
+            measuring_now = now_measuring;
+
             // Taking the strip over before there is anything to put on it would
             // switch the light on and show nothing, so the preview waits for the
             // first calibrated reading — which is what happens when the operator
-            // saves a calibration from the page they already have open.
+            // saves a calibration from the page they already have open. A
+            // measurement does not end the preview: it only stops the frames.
             let ready = *watching.borrow_and_update()
                 && latest
                     .borrow()
@@ -100,6 +125,10 @@ fn spawn_ambient_bridge(
                 if commands.send(message).await.is_err() {
                     break;
                 }
+            }
+
+            if !ready || now_measuring {
+                continue;
             }
 
             if !ready {

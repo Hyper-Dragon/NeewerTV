@@ -87,6 +87,14 @@ pub enum Message {
     Tick(u64),
     /// Stop any alert, optionally restoring first.
     Cancel { replay: bool },
+    /// Darken the strip for a flat-field measurement, keeping the preview.
+    ///
+    /// Not [`Self::AmbientStop`]: the preview is still running and still owns the
+    /// restore point, it simply has to stop shining at the screen it is about to
+    /// be asked about.
+    AmbientSuspend,
+    /// Light the strip again after [`Self::AmbientSuspend`].
+    AmbientResume,
     /// Somebody opened the calibration page: follow the camera, and remember what
     /// to put back when they leave.
     AmbientStart,
@@ -205,6 +213,12 @@ struct AmbientPreview {
     /// Whether the strip was lit when the preview began, which decides which of
     /// the two restores is the right one.
     was_on: bool,
+    /// Darkened for a flat-field measurement. Camera frames are dropped until it
+    /// lifts, because a colour would relight the screen being measured.
+    suspended: bool,
+    /// Whether the strip was lit when the measurement darkened it, so the resume
+    /// puts back the light the preview had rather than the light it inherited.
+    suspended_lit: bool,
 }
 
 /// Why an attach or a write failed, carrying the decision it earned.
@@ -426,6 +440,8 @@ impl<L: Link> Worker<L> {
                             // only record of what the strip was doing.
                             restore: self.restore_points(),
                             was_on,
+                            suspended: false,
+                            suspended_lit: false,
                         });
 
                         // A preview that drives a dark strip is indistinguishable
@@ -472,7 +488,11 @@ impl<L: Link> Worker<L> {
 
                     // No preview running means the page was closed mid-flight, or
                     // a user command ended it. Either way this frame is stale.
-                    if self.ambient.is_some() {
+                    let driving = self
+                        .ambient
+                        .as_ref()
+                        .is_some_and(|preview| !preview.suspended);
+                    if driving {
                         match command::frames(&Command::Segments {
                             entries,
                             brightness,
@@ -488,6 +508,40 @@ impl<L: Link> Worker<L> {
                                 tracing::debug!(%err, "ambient frame could not be encoded")
                             }
                         }
+                    }
+                }
+
+                Message::AmbientSuspend => {
+                    if let Some(preview) = self.ambient.as_mut()
+                        && !preview.suspended
+                    {
+                        preview.suspended = true;
+                        preview.suspended_lit = self.snapshot.on;
+                        // Dark now, and re-lit on resume: whatever the strip was
+                        // showing would be light landing on the screen the
+                        // measurement is trying to describe.
+                        if self.snapshot.on {
+                            if let Err(failure) = self.write_all(&[wire::power(false)]).await {
+                                self.snapshot.last_error = Some(failure.error.to_string());
+                            }
+                            self.snapshot.on = false;
+                        }
+                        tracing::info!("ambient preview suspended for a measurement");
+                    }
+                }
+
+                Message::AmbientResume => {
+                    if let Some(preview) = self.ambient.as_mut()
+                        && preview.suspended
+                    {
+                        preview.suspended = false;
+                        if preview.suspended_lit {
+                            if let Err(failure) = self.write_all(&[wire::power(true)]).await {
+                                self.snapshot.last_error = Some(failure.error.to_string());
+                            }
+                            self.snapshot.on = true;
+                        }
+                        tracing::info!("ambient preview resumed");
                     }
                 }
 
@@ -2143,6 +2197,45 @@ mod tests {
         assert_eq!(
             state.unacknowledged, 1,
             "the camera frame takes the fast path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_measurement_darkens_the_strip_and_drops_the_frames_it_would_show() {
+        // The strip is a light source pointed at the screen being measured. In a
+        // dark room its own output is most of what the camera sees, so a
+        // measurement taken with it lit describes the strip rather than the panel.
+        let (link, _) = FakeLink::new(0);
+        let (state, _) = drain_paced(
+            Worker::new(link),
+            vec![
+                Message::AmbientStart,
+                Message::AmbientSuspend,
+                ambient(30),
+                Message::AmbientResume,
+                ambient(60),
+            ],
+        )
+        .await;
+
+        let state = state.lock().unwrap();
+        // Wake, darken, relight, and exactly one colour frame.
+        assert_eq!(
+            state.writes.len(),
+            4,
+            "expected power on, power off, power on, one frame"
+        );
+
+        let frames: Vec<_> = state
+            .writes
+            .iter()
+            .filter(|frame| frame.get(1) == Some(&0x0d))
+            .collect();
+        assert_eq!(frames.len(), 1, "the frame sent while suspended is dropped");
+        assert!(
+            frames[0].windows(4).any(|window| window == [50, 0, 0, 60]),
+            "the surviving frame is the one sent after the resume, got {:02x?}",
+            frames[0]
         );
     }
 
