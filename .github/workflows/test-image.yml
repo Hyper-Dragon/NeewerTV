@@ -15,6 +15,10 @@ on:
       - "feat/**"
       - "fix/**"
       - "test/**"
+      # The bare branch as well. `test/**` needs something after the slash, so
+      # `test` on its own would silently build nothing — and `test` is the branch
+      # that carries mainline for the `:test` tag.
+      - "test"
 
 env:
   REGISTRY: ghcr.io
