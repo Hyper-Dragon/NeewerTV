@@ -8,6 +8,130 @@ All notable changes to this project. The format follows
 
 Nothing yet.
 
+## [0.2.1] — 2026-11-11
+
+Ambient mode. Point a camera at the television and the strip follows what is on it:
+twenty zones sampled from twenty parts of the panel, one per addressable segment. No
+screen capture and no display-server access, so it works from the same container with
+nothing but a camera passed through.
+
+It shows up in Home Assistant as a `TV Ambient` effect, sitting at the top of the
+effect list. Pick it and the strip follows the camera with nothing else running;
+pick anything else and the mode stops before your colour is sent. It survives a
+restart and a power cut, because it is written to the calibration file — the only
+thing that outlives both the daemon and the strip's own memory.
+
+Setting it up is four clicked corners and two flat fields. That second part is what
+makes it work: a camera left to itself hunts the scene and cancels out the screen's
+colour, so the calibration page can pin the white balance, step the exposure until a
+white field lands in a usable window, and then subtract the room and the lens shading
+from every zone. It also keeps the tuning that makes the strip look like the picture
+rather than like a camera reading, and shows you the exact numbers it is sending as
+swatches so you can see the effect of a change before walking over to the telly.
+
+Screenshots do not do it justice and neither does this paragraph. There is a camera
+on the page, a zone map over it, and a `TV Ambient` switch to try it from.
+
+### Added
+
+- **Ambient capture**: V4L2 camera, four clicked corners, a homography, and twenty
+  zone rectangles sampled from the frame. MJPEG is forwarded untouched, YUYV is
+  converted here, and neither needs an encoder.
+- **The `TV Ambient` effect**, offered only where a calibration exists — an effect
+  that does nothing is worse than an absent one. Any other command ends the mode
+  first, so a camera frame cannot overwrite a colour sixty milliseconds later.
+- **Auto-calibration** from a white field: pin the white balance, force manual
+  exposure, step it into range, and store the white field with the camera settings.
+- **A flat field**, white and black, applied per sample in linear light — an affine
+  correction does not commute with averaging.
+- **A calibration page**: live preview with the zone map drawn on it, the camera's
+  own controls, swatches drawn from the exact numbers the strip is sent, the six
+  tuning values with a description each, and a recording you can download when
+  something looks wrong.
+- **A diagnostic download** bundling that recording with the calibration, the camera
+  settings, the link state and the log.
+
+### Fixed
+
+- **The calibration page drew the wrong colour in its segment swatches.** Hue
+  reached the page normalised to 0–255 rather than as a fraction of a turn, so
+  every hue was stretched by 1.41× and wrapped past 181°: a blue zone was painted
+  magenta. The swatches are the one place the strip's output can be judged without
+  walking over to the television, and they had stopped describing what was being
+  sent. The strip was never affected — only the preview of it — but every judgement
+  made from the swatches was made against the wrong colour.
+- **Auto-calibration pushed the camera onto its own highlight ceiling, which turns
+  colour into white.** The white field was targeted at 0.75 in linear light, about
+  sRGB 225, on the theory that a highlight in the picture should still have room.
+  That camera tops out nearer sRGB 204 and desaturates as it approaches it, so a
+  blue sky measured `204,204,204` and the strip painted it white — and nothing
+  caught it, because clipping is counted at 252 and this camera can never reach 252
+  to be counted. The target is now 0.45 (sRGB ~180) with the window at 0.30–0.65,
+  which keeps the white field off the shoulder that throws the colour away.
+- **A failed auto-calibration left the camera at its limit.** The search is the one
+  thing that moves the camera without being asked to, and when it could not reach
+  the window it stopped wherever it ran out — maximum exposure, then maximum gain —
+  so the next ordinary picture came back as a flat wash with nothing in the log to
+  explain it. A search that stores nothing now puts every control back where it
+  found it.
+- **Auto-calibration optimised whatever was in front of the camera.** A picture can
+  never satisfy the white target, so the search ran to the limit. The zones now have
+  to read evenly first — a white field does at any exposure, a picture does not —
+  and anything else is refused before the camera is touched, with the same evidence
+  `Measure white` has always asked for.
+- **Clipping was counted at 252, which some cameras can never reach.** This camera
+  saturates near sRGB 204 and desaturates on the way there, so its highlights were
+  reported as ordinary colour and a blue sky was fed to the strip as white. The clip
+  level is now taken from each frame's own peak: whatever the brightest sample is,
+  anything on it is on the plateau. A full-range camera's peak is 255, so it reads
+  the same as before.
+- **The selected tab was the dark one.** The tab rules were written after the
+  dark-mode block, and an equally specific rule that comes later wins, so the
+  unselected tab kept its light background and the selected one kept its dark one —
+  the opposite of what the class means.
+- **The calibration page's ambient switch wrote the mode Home Assistant owns.**
+  Ticking it to see what the strip would do saved `ambient` into the calibration file
+  and published the effect, so the light stayed in ambient mode after the browser was
+  closed. The page now has a switch of its own, held in memory and gated on the page
+  being open: it writes nothing, publishes nothing, and means nothing once the preview
+  ends. Leaving the screen hands the strip back to Home Assistant, which is the only
+  place the mode can be set.
+
+### Changed
+
+- **The *Linear light* checkbox is gone; sampling is always linear.** There is no
+  reading for which averaging gamma-encoded bytes is the right arithmetic, and a flat
+  field only exists in linear light, so the box could only ever make the picture
+  wrong.
+- **The *Raw camera* checkbox is gone.** It was a diagnostic that had to be explained
+  before it could be used. `POST /api/ambient/bypass` still exists for anyone who
+  wants it from a script.
+- **The six tuning boxes say what they do, and are clamped to the range beside
+  them.** Typing an out-of-range value used to become a refused save with "the render
+  settings are outside their ranges"; it now snaps back and says so. Values are shown
+  rounded, so a gain reads `1.3` rather than `1.2999999523162842`.
+- **A measurement answers with a toast** instead of leaving a pair of ticks under the
+  buttons that could not say which run of which button put them there, or whether the
+  run had warned about something.
+- **The flat-field section says which button does what.** *Auto-calibrate* takes the
+  white field and the camera settings; *Measure black* is still required because
+  auto-calibration never looks at black; *Measure white* is the fallback for cameras
+  with no absolute exposure control.
+- **The page points at a white or black screen you already have** — there are ten-hour
+  versions on YouTube — rather than assuming a calibration video nobody else has.
+- **`TV Ambient` leads Home Assistant's effect list**, followed by the `TV Screen`
+  family, with the vendor catalogue behind them. It used to be appended after fifty
+  effects, which is where nobody finds it.
+- **The calibration page has the same footer as the monitor page**, and its heading
+  says *Experimental*, which is the one thing worth knowing before clicking corners.
+- **The copy on the calibration page reads like help rather than notes.** The
+  descriptions explained the mechanism but not the decision.
+- **New defaults: a 26% band, a base glow of 1, smoothing of 0.2.** A tenth of the
+  height samples the black bars of a letterboxed film and switches the backlight off
+  during the film it was bought for. A base glow of 1 stops the strip's non-linear
+  bottom end flickering between lit and off as a scene creeps towards black. 0.2
+  smoothing takes the edge off sensor noise without lagging a cut by visible steps.
+
 ## [0.1.6] — 2026-11-04
 
 An alert fired at a strip that was switched off used to flash at a device that was

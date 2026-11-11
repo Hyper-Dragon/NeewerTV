@@ -29,9 +29,14 @@ const MANUFACTURER: &str = "NEEWER";
 const MODEL: &str = "NS03";
 
 /// Build the retained discovery message body.
+///
+/// `ambient` says whether this deployment can follow the camera at all, which is
+/// the same question as whether a calibration exists. Home Assistant is offered
+/// the mode only when it would work: an effect in the list that does nothing is
+/// worse than one that is absent.
 #[must_use]
-pub fn discovery_payload(config: &Config) -> String {
-    let effects: Vec<&str> = catalogue::all().iter().map(|effect| effect.name).collect();
+pub fn discovery_payload(config: &Config, ambient: bool) -> String {
+    let effects = published_effects(ambient);
 
     json!({
         "name": config.device.name,
@@ -54,6 +59,36 @@ pub fn discovery_payload(config: &Config) -> String {
         },
     })
     .to_string()
+}
+
+/// The effect names in the order Home Assistant shows them.
+///
+/// The list is long — fifty-odd vendor names — so what is at the top is what anyone
+/// actually finds. Ambient goes first on a deployment that has one: it is what the
+/// camera work exists for, and appended at the end it sat below every music mode.
+/// Screen sync follows, because it is the other thing on the list driven by
+/// something other than a fixed palette, and everything else keeps catalogue order
+/// behind them.
+///
+/// Only the published order changes. An effect is selected by name and the names
+/// are untouched, so nothing on the wire moves.
+fn published_effects(ambient: bool) -> Vec<&'static str> {
+    let all = catalogue::all();
+    let mut names = Vec::with_capacity(all.len() + usize::from(ambient));
+    if ambient {
+        names.push(crate::ambient::MODE_EFFECT);
+    }
+    names.extend(
+        all.iter()
+            .filter(|effect| effect.kind == catalogue::Kind::TwoWay)
+            .map(|effect| effect.name),
+    );
+    names.extend(
+        all.iter()
+            .filter(|effect| effect.kind != catalogue::Kind::TwoWay)
+            .map(|effect| effect.name),
+    );
+    names
 }
 
 /// Build the retained state message body.
@@ -232,7 +267,12 @@ const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 /// light offline. A daemon that only announced itself at startup would survive a
 /// broker restart by going permanently deaf while every liveness check reported
 /// healthy.
-async fn announce(client: &AsyncClient, config: &Config, available: bool) -> anyhow::Result<()> {
+async fn announce(
+    client: &AsyncClient,
+    config: &Config,
+    available: bool,
+    ambient: bool,
+) -> anyhow::Result<()> {
     for topic in subscriptions(config) {
         client
             .subscribe(&topic, QoS::AtLeastOnce)
@@ -246,7 +286,7 @@ async fn announce(client: &AsyncClient, config: &Config, available: bool) -> any
             discovery::topic(&config.mqtt.disc_prefix, &config.device.id),
             QoS::AtLeastOnce,
             true,
-            discovery_payload(config),
+            discovery_payload(config, ambient),
         )
         .await
         .with_context_msg("publishing discovery")?;
@@ -340,6 +380,7 @@ pub async fn run(
     config: Config,
     mut state: tokio::sync::watch::Receiver<Snapshot>,
     commands: tokio::sync::mpsc::Sender<crate::ble::worker::Message>,
+    ambient: Option<crate::ambient::Handle>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let (client, mut eventloop) = AsyncClient::new(options(&config), 32);
@@ -349,8 +390,31 @@ pub async fn run(
     let state_topic = config.mqtt.topic(topic::STATE);
     let mut last_state = String::new();
     let mut last_available: Option<bool> = None;
+    // `None` until the first connection has announced, so the loop below only
+    // republishes on a *change* rather than racing the ConnAck handler.
+    let mut announced_ambient: Option<bool> = None;
 
     loop {
+        // The discovery payload is retained and only rewritten on connect, so a
+        // calibration saved from the page after start-up would otherwise leave
+        // Home Assistant offering an effect it never mentions — or, on a fresh
+        // install, offering one that does nothing. Re-announcing on a change is
+        // what makes the page the thing that turns the mode on, rather than a
+        // restart being the thing that does.
+        //
+        // The keepalive alone brings the loop round every thirty seconds, which is
+        // often enough for something a person has to walk over and click.
+        let ambient_now = ambient
+            .as_ref()
+            .is_some_and(|handle| handle.calibration().is_some());
+        if announced_ambient.is_some_and(|announced| announced != ambient_now) {
+            let connected = state.borrow().connected;
+            match announce(&client, &config, connected, ambient_now).await {
+                Ok(()) => announced_ambient = Some(ambient_now),
+                Err(err) => tracing::warn!(%err, "re-announcing after the calibration changed"),
+            }
+        }
+
         tokio::select! {
             event = eventloop.poll() => {
                 match event {
@@ -358,9 +422,10 @@ pub async fn run(
                         tracing::info!("MQTT connected");
                         let snapshot = state.borrow().clone();
 
-                        if let Err(err) = announce(&client, &config, snapshot.connected).await {
+                        if let Err(err) = announce(&client, &config, snapshot.connected, ambient_now).await {
                             tracing::warn!(%err, "announcing on connect");
                         }
+                        announced_ambient = Some(ambient_now);
                         last_available = Some(snapshot.connected);
 
                         // Whatever Home Assistant last saw is now stale: the
@@ -369,7 +434,7 @@ pub async fn run(
                         last_state = publish_state(&client, &state_topic, &snapshot).await;
                     }
                     Ok(Event::Incoming(Packet::Publish(publish))) => {
-                        handle_publish(&publish, &set_topic, &alert_prefix, &commands).await;
+                        handle_publish(&publish, &set_topic, &alert_prefix, &commands, ambient.as_ref()).await;
                     }
                     Ok(_) => {}
                     Err(err) => {
@@ -421,25 +486,57 @@ async fn handle_publish(
     set_topic: &str,
     alert_prefix: &str,
     commands: &tokio::sync::mpsc::Sender<crate::ble::worker::Message>,
+    ambient: Option<&crate::ambient::Handle>,
 ) {
     let topic = publish.topic.as_str();
 
     if topic == set_topic {
         match serde_json::from_slice::<SetPayload>(&publish.payload) {
-            Ok(payload) => match command::resolve(&payload) {
-                Ok(resolved) if resolved.is_empty() => {}
-                Ok(resolved) => {
-                    let batch = crate::app::queue::Batch { commands: resolved };
-                    if commands
-                        .send(crate::ble::worker::Message::Batch(batch))
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!("worker has gone away");
+            Ok(payload) => {
+                // Ambient is a mode of this daemon rather than a frame the strip
+                // understands, so it is intercepted before the wire encoder can
+                // reject it as an unknown effect.
+                //
+                // Only honoured when there is a calibration to follow. Without
+                // one the mode would be a flag that drives nothing, and — worse —
+                // it would swallow the rest of the payload, so a retained
+                // discovery message from before the calibration was deleted could
+                // leave a light that answers nothing at all. Falling through sends
+                // the command to the encoder, which rejects the name and says so.
+                if payload.effect.as_deref() == Some(crate::ambient::MODE_EFFECT) {
+                    let calibrated = ambient.is_some_and(|ambient| ambient.calibration().is_some());
+                    if calibrated {
+                        tracing::info!("ambient mode requested");
+                        if let Some(ambient) = ambient {
+                            ambient.set_mode(true);
+                        }
+                        return;
                     }
+                    tracing::warn!("ambient mode requested but this deployment has no calibration");
                 }
-                Err(err) => tracing::warn!(%err, "rejecting command"),
-            },
+
+                match command::resolve(&payload) {
+                    // Anything the strip is actually told to do ends ambient mode.
+                    // Otherwise the camera would overwrite a colour a frame later,
+                    // which is the defect the mode exists to avoid.
+                    Ok(resolved) if resolved.is_empty() => {}
+                    Ok(resolved) => {
+                        if let Some(ambient) = ambient {
+                            ambient.set_mode(false);
+                        }
+
+                        let batch = crate::app::queue::Batch { commands: resolved };
+                        if commands
+                            .send(crate::ble::worker::Message::Batch(batch))
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!("worker has gone away");
+                        }
+                    }
+                    Err(err) => tracing::warn!(%err, "rejecting command"),
+                }
+            }
             Err(err) => {
                 tracing::warn!(%err, payload = %String::from_utf8_lossy(&publish.payload), "malformed set payload")
             }
@@ -483,7 +580,7 @@ mod tests {
 
     #[test]
     fn discovery_names_the_topics_home_assistant_will_use() {
-        let payload: Value = serde_json::from_str(&discovery_payload(&config())).unwrap();
+        let payload: Value = serde_json::from_str(&discovery_payload(&config(), false)).unwrap();
         assert_eq!(payload["command_topic"], "neewertv/set");
         assert_eq!(payload["state_topic"], "neewertv/state");
         assert_eq!(payload["availability_topic"], "neewertv/availability");
@@ -494,10 +591,59 @@ mod tests {
 
     #[test]
     fn discovery_offers_every_effect_in_the_catalogue() {
-        let payload: Value = serde_json::from_str(&discovery_payload(&config())).unwrap();
+        let payload: Value = serde_json::from_str(&discovery_payload(&config(), false)).unwrap();
         let effects = payload["effect_list"].as_array().unwrap();
         assert_eq!(effects.len(), catalogue::all().len());
         assert!(effects.iter().any(|e| e == "Superfluid"));
+    }
+
+    #[test]
+    fn ambient_is_offered_only_where_it_would_work() {
+        // An effect in the list that does nothing is worse than an absent one, so
+        // the mode only appears when there is a calibration behind it.
+        let without: Value = serde_json::from_str(&discovery_payload(&config(), false)).unwrap();
+        assert!(
+            !without["effect_list"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e == crate::ambient::MODE_EFFECT)
+        );
+
+        let with: Value = serde_json::from_str(&discovery_payload(&config(), true)).unwrap();
+        let effects = with["effect_list"].as_array().unwrap();
+        assert_eq!(effects.len(), catalogue::all().len() + 1);
+        assert!(effects.iter().any(|e| e == crate::ambient::MODE_EFFECT));
+    }
+
+    #[test]
+    fn ambient_is_first_and_screen_sync_follows_it() {
+        // The list is fifty names long, so whatever is at the top is what anyone
+        // finds. Ambient used to be appended last, below every music mode.
+        let names = published_effects(true);
+        assert_eq!(names[0], crate::ambient::MODE_EFFECT);
+
+        let sync: Vec<&str> = catalogue::all()
+            .iter()
+            .filter(|effect| effect.kind == catalogue::Kind::TwoWay)
+            .map(|effect| effect.name)
+            .collect();
+        assert_eq!(&names[1..=sync.len()], sync.as_slice());
+
+        // Everything else is still there, once each, and nothing was invented.
+        assert_eq!(names.len(), catalogue::all().len() + 1);
+        let mut seen = names.clone();
+        seen.sort_unstable();
+        let deduped = {
+            let mut copy = seen.clone();
+            copy.dedup();
+            copy
+        };
+        assert_eq!(seen, deduped, "a name appears twice");
+
+        // Without ambient the sync family still leads.
+        let plain = published_effects(false);
+        assert_eq!(&plain[..sync.len()], sync.as_slice());
     }
 
     #[test]
@@ -641,5 +787,86 @@ mod tests {
             assert_eq!(frame[0], 0x7A, "header");
             assert_eq!(crate::protocol::frame::verify(frame), Ok(()));
         }
+    }
+
+    // A mode and a command both want the strip, and which of them wins is decided
+    // by the order two statements run in. That is not something a screenshot can
+    // show, so it is pinned here.
+
+    fn ambient_handle(with_calibration: bool) -> crate::ambient::Handle {
+        use crate::ambient::test_support;
+        crate::ambient::Handle::for_test(
+            with_calibration.then(test_support::calibration),
+            test_support::scratch_path(),
+        )
+    }
+
+    fn a_publish(body: &str) -> rumqttc::Publish {
+        rumqttc::Publish::new("neewertv/set", QoS::AtLeastOnce, body)
+    }
+
+    #[tokio::test]
+    async fn choosing_the_ambient_effect_turns_the_mode_on_and_sends_no_frame() {
+        let ambient = ambient_handle(true);
+        let (commands, mut sent) = tokio::sync::mpsc::channel(4);
+
+        handle_publish(
+            &a_publish(r#"{"effect":"TV Ambient"}"#),
+            "neewertv/set",
+            "neewertv/alert",
+            &commands,
+            Some(&ambient),
+        )
+        .await;
+
+        assert!(ambient.mode(), "the mode is the whole point of choosing it");
+        // The wire encoder would refuse the name, so nothing may reach it: this
+        // asserts the interception happened before the command was queued.
+        assert!(
+            sent.try_recv().is_err(),
+            "an effect the daemon owns must not be sent to the strip"
+        );
+    }
+
+    #[tokio::test]
+    async fn any_command_that_reaches_the_strip_ends_ambient_mode() {
+        let ambient = ambient_handle(true);
+        let (commands, mut sent) = tokio::sync::mpsc::channel(4);
+        ambient.set_mode(true);
+
+        handle_publish(
+            &a_publish(r#"{"color":{"r":255,"g":0,"b":0}}"#),
+            "neewertv/set",
+            "neewertv/alert",
+            &commands,
+            Some(&ambient),
+        )
+        .await;
+
+        // Both halves matter. Left on, a camera frame would repaint the strip
+        // sixty-six milliseconds after the colour landed.
+        assert!(!ambient.mode(), "the colour must outrank the camera");
+        assert!(sent.try_recv().is_ok(), "the colour still has to be sent");
+    }
+
+    #[tokio::test]
+    async fn the_ambient_effect_is_ignored_when_nothing_could_follow_it() {
+        // A retained discovery message can outlive the calibration it was written
+        // for. Honouring the effect then would set a flag that drives nothing and
+        // swallow the rest of the payload, so the request falls through instead.
+        let ambient = ambient_handle(false);
+        let (commands, mut sent) = tokio::sync::mpsc::channel(4);
+
+        handle_publish(
+            &a_publish(r#"{"effect":"TV Ambient"}"#),
+            "neewertv/set",
+            "neewertv/alert",
+            &commands,
+            Some(&ambient),
+        )
+        .await;
+
+        assert!(!ambient.mode());
+        assert!(sent.try_recv().is_err());
     }
 }

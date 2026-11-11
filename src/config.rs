@@ -8,27 +8,45 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context as _, bail};
 
 /// What the optional web interface is allowed to do.
 ///
-/// There is deliberately no control mode. Driving the strip over HTTP meant
-/// maintaining a second control path with its own precedence rules, and it could
-/// not do anything Home Assistant cannot — so the page shows state and nothing
-/// else, and the only thing that changes the light is MQTT.
+/// There is deliberately no control mode for the *strip*. Driving the light over
+/// HTTP meant maintaining a second control path with its own precedence rules,
+/// and it could not do anything Home Assistant cannot — so the page reports what
+/// the daemon believes and the only thing that moves the light is MQTT.
+///
+/// [`WebMode::Ambient`] adds exactly one exception, and it is not an exception to
+/// that rule: the calibration screen writes a calibration file and nothing else.
+/// It cannot set a colour, a brightness or an effect, so the promise above still
+/// holds. It exists as its own mode so a box can be calibrated once and then put
+/// back into [`WebMode::Observe`] or [`WebMode::Off`] with the camera still
+/// running from the file left behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebMode {
     /// No listener at all.
     Off,
     /// Health, state and a status page. Read-only.
     Observe,
+    /// Observe, plus the ambient calibration screen and the camera preview.
+    Ambient,
 }
 
 impl WebMode {
     pub const fn is_enabled(self) -> bool {
         !matches!(self, Self::Off)
+    }
+
+    /// Whether this mode serves the calibration screen.
+    ///
+    /// Only the screen: the camera itself runs whenever a calibration exists, so
+    /// dropping back to `observe` after calibrating keeps the mode working.
+    pub const fn permits_calibration(self) -> bool {
+        matches!(self, Self::Ambient)
     }
 }
 
@@ -37,6 +55,7 @@ impl fmt::Display for WebMode {
         f.write_str(match self {
             Self::Off => "off",
             Self::Observe => "observe",
+            Self::Ambient => "ambient",
         })
     }
 }
@@ -48,7 +67,8 @@ impl FromStr for WebMode {
         match raw.trim().to_ascii_lowercase().as_str() {
             "off" | "false" | "0" | "no" => Ok(Self::Off),
             "observe" | "readonly" | "read-only" => Ok(Self::Observe),
-            other => bail!("expected one of off, observe — got {other:?}"),
+            "ambient" | "camera" | "calibrate" => Ok(Self::Ambient),
+            other => bail!("expected one of off, observe, ambient — got {other:?}"),
         }
     }
 }
@@ -126,6 +146,21 @@ pub struct DeviceConfig {
     pub name: String,
 }
 
+/// Where the ambient capture gets its frames, and where its calibration lives.
+///
+/// The calibration path is the durable half of the feature: the camera is bolted
+/// in one position for good, so the corners are clicked once and then read back
+/// on every start, including starts where the calibration screen is switched off.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AmbientConfig {
+    /// Any V4L2 device node the container can see, e.g. `/dev/video0`.
+    pub camera: PathBuf,
+    /// JSON file holding the corners, aspect and depth. On a volume.
+    pub calibration: PathBuf,
+    /// Upper bound on samples per second, zero for no bound.
+    pub max_fps: u8,
+}
+
 /// Every environment variable the daemon reads.
 ///
 /// Named because they appear both in the lookup and in the error messages that
@@ -146,6 +181,9 @@ pub mod env {
     pub const ALERT_BUTTON_LENGTH: &str = "ALERT_BUTTON_LENGTH";
     pub const DEVICE_ID: &str = "DEVICE_ID";
     pub const DEVICE_NAME: &str = "DEVICE_NAME";
+    pub const AMBIENT_CAMERA: &str = "AMBIENT_CAMERA";
+    pub const AMBIENT_CALIBRATION: &str = "AMBIENT_CALIBRATION";
+    pub const AMBIENT_MAX_FPS: &str = "AMBIENT_MAX_FPS";
     pub const WEB_INTERFACE: &str = "WEB_INTERFACE";
     pub const WEB_BIND: &str = "WEB_BIND";
     pub const LOG_LEVEL: &str = "LOG_LEVEL";
@@ -195,6 +233,16 @@ pub mod default {
     pub const LOG_LEVEL: &str = "info";
     /// The page is useful and changes nothing, so it is on by default.
     pub const WEB_INTERFACE: super::WebMode = super::WebMode::Observe;
+    /// The first V4L2 device, which is the only camera in a one-camera container.
+    pub const AMBIENT_CAMERA: &str = "/dev/video0";
+    /// `/data` is the conventional mount point for an application's own volume,
+    /// and this file has to outlive the container: re-clicking four corners after
+    /// every update would defeat the point of a fixed camera.
+    pub const AMBIENT_CALIBRATION: &str = "/data/ambient-calibration.json";
+    /// Half of what most cameras offer, and more than the bluetooth link can
+    /// carry. It exists to bound the work on a small box with an eager camera,
+    /// not because the sampler is slow; zero means no cap at all.
+    pub const AMBIENT_MAX_FPS: u8 = 15;
 }
 
 /// Which alert colours to publish as buttons, and how long they last.
@@ -212,7 +260,7 @@ pub struct AlertConfig {
 }
 
 /// Everything the daemon needs to start.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub web: WebMode,
     pub web_bind: SocketAddr,
@@ -222,6 +270,7 @@ pub struct Config {
     pub ble: BleConfig,
     pub device: DeviceConfig,
     pub alerts: AlertConfig,
+    pub ambient: AmbientConfig,
 }
 
 impl Config {
@@ -280,6 +329,18 @@ impl Config {
                 .clamp(1, 300),
         };
 
+        let ambient = AmbientConfig {
+            camera: PathBuf::from(
+                get(env::AMBIENT_CAMERA).unwrap_or_else(|| default::AMBIENT_CAMERA.to_owned()),
+            ),
+            calibration: PathBuf::from(
+                get(env::AMBIENT_CALIBRATION)
+                    .unwrap_or_else(|| default::AMBIENT_CALIBRATION.to_owned()),
+            ),
+            max_fps: parse_or(&get, env::AMBIENT_MAX_FPS, default::AMBIENT_MAX_FPS)?
+                .min(MAX_AMBIENT_FPS),
+        };
+
         Ok(Self {
             web: parse_or(&get, env::WEB_INTERFACE, default::WEB_INTERFACE)?,
             web_bind: match get(env::WEB_BIND) {
@@ -294,9 +355,14 @@ impl Config {
             ble,
             device,
             alerts,
+            ambient,
         })
     }
 }
+
+/// The highest sample rate anybody can sensibly ask for: the camera will not go
+/// above sixty and neither should the setting.
+const MAX_AMBIENT_FPS: u8 = 60;
 
 /// Turn `ALERT_BUTTONS` into colours, rejecting names that do not exist.
 ///
@@ -542,6 +608,30 @@ mod tests {
                 "{raw:?} should be rejected now that controls are gone"
             );
         }
+    }
+
+    #[test]
+    fn ambient_is_its_own_web_mode_with_its_own_defaults() {
+        for raw in ["ambient", "AMBIENT", "calibrate", "camera"] {
+            let mode = config(&[("MQTT_HOST", "h"), ("WEB_INTERFACE", raw)])
+                .unwrap()
+                .web;
+            assert_eq!(mode, WebMode::Ambient, "{raw:?}");
+            // Ambient has to keep serving the status page: the calibration
+            // screen is a tab beside it, not a replacement for it.
+            assert!(mode.is_enabled());
+            assert!(mode.permits_calibration());
+        }
+        assert!(!WebMode::Observe.permits_calibration());
+        assert!(!WebMode::Off.permits_calibration());
+
+        let parsed = config(MINIMAL).unwrap();
+        assert_eq!(parsed.ambient.camera, PathBuf::from("/dev/video0"));
+        assert_eq!(
+            parsed.ambient.calibration,
+            PathBuf::from("/data/ambient-calibration.json")
+        );
+        assert_eq!(parsed.ambient.max_fps, 15);
     }
 
     #[test]

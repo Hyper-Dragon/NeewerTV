@@ -69,6 +69,14 @@ const ALERT_REPLY_MS: u64 = 400;
 /// schedule rather than inside a single command.
 const IMMEDIATE_ATTEMPTS: u32 = 2;
 
+/// How many times a write the stack called busy is retried, and how far apart.
+///
+/// A busy write is not a lost one: it is a frame that arrived while the previous
+/// one was still on air. Three tries at ten milliseconds covers a connection
+/// interval or two, which is longer than any write this daemon sends.
+const BUSY_RETRIES: u32 = 3;
+const BUSY_RETRY: Duration = Duration::from_millis(10);
+
 /// How long a keep-alive waits for its own reply before giving up on it.
 ///
 /// The answer is discarded either way; the wait only exists so the worker does
@@ -87,6 +95,27 @@ pub enum Message {
     Tick(u64),
     /// Stop any alert, optionally restoring first.
     Cancel { replay: bool },
+    /// Darken the strip for a flat-field measurement, keeping the preview.
+    ///
+    /// Not [`Self::AmbientStop`]: the preview is still running and still owns the
+    /// restore point, it simply has to stop shining at the screen it is about to
+    /// be asked about.
+    AmbientSuspend,
+    /// Light the strip again after [`Self::AmbientSuspend`].
+    AmbientResume,
+    /// Somebody opened the calibration page: follow the camera, and remember what
+    /// to put back when they leave.
+    AmbientStart,
+    /// Twenty segment colours from the camera.
+    ///
+    /// Dropped when no preview is running, so a page left open in one tab cannot
+    /// keep overwriting a command sent from another.
+    Ambient {
+        entries: Vec<(u8, u16, u8)>,
+        brightness: u16,
+    },
+    /// The calibration page was closed: put the strip back.
+    AmbientStop,
     /// Release the link and stop. Sent on shutdown, and the reason the process
     /// waits for this task instead of exiting underneath it.
     Shutdown,
@@ -129,6 +158,19 @@ pub struct Snapshot {
     pub commands_received: u64,
     pub commands_coalesced: u64,
     pub writes_sent: u64,
+    /// Whether the strip is being driven by the ambient preview right now.
+    ///
+    /// Published because the failure this prevents is silent: a user command
+    /// takes the strip over, the page keeps drawing colours, and nothing says
+    /// that those colours are going nowhere.
+    pub preview: bool,
+    /// Ambient frames that were superseded before they could be written.
+    ///
+    /// Not a fault: the camera samples faster than the link can carry, and a
+    /// colour the screen has already left behind is not worth sending. It is
+    /// worth counting, because it is the difference between the rate the page
+    /// shows and the rate the strip actually updates at.
+    pub frames_skipped: u64,
     pub last_error: Option<String>,
 }
 
@@ -171,6 +213,29 @@ pub struct Worker<L: Link> {
     keepalive_ms: u64,
     /// When the link last carried anything, keep-alive included.
     last_traffic: u64,
+    /// The ambient preview in progress, and what to put back when it ends.
+    ambient: Option<AmbientPreview>,
+}
+
+/// A preview being driven from the calibration page.
+///
+/// It borrows the machinery an alert already uses: capture what the strip looks
+/// like *before* taking it over, in both of the states it may be in, and replay
+/// the right one when the takeover ends.
+struct AmbientPreview {
+    restore: Restore,
+    /// Whether the strip was lit when the preview began, which decides which of
+    /// the two restores is the right one.
+    was_on: bool,
+    /// What Home Assistant was told the light was doing, so that ending the mode
+    /// puts it back rather than leaving the mode's name on screen for ever.
+    effect: Option<String>,
+    /// Darkened for a flat-field measurement. Camera frames are dropped until it
+    /// lifts, because a colour would relight the screen being measured.
+    suspended: bool,
+    /// Whether the strip was lit when the measurement darkened it, so the resume
+    /// puts back the light the preview had rather than the light it inherited.
+    suspended_lit: bool,
 }
 
 /// Why an attach or a write failed, carrying the decision it earned.
@@ -208,6 +273,7 @@ impl<L: Link> Worker<L> {
             up_since: 0,
             keepalive_ms: 0,
             last_traffic: 0,
+            ambient: None,
         }
     }
 
@@ -235,6 +301,12 @@ impl<L: Link> Worker<L> {
             match message {
                 Message::Batch(batch) => {
                     self.snapshot.commands_received += 1;
+                    // A command from the user outranks a preview. Ending it here
+                    // means the next camera frame is dropped rather than
+                    // overwriting what they just asked for a frame later. The
+                    // bridge puts the preview back once they have stopped.
+                    self.ambient = None;
+                    self.snapshot.preview = false;
                     self.queue.push(batch);
 
                     // Absorb whatever else is already waiting, so a slider drag
@@ -372,6 +444,146 @@ impl<L: Link> Worker<L> {
                     // the adoption below refuses to overwrite a command.
                     if self.link.is_up().await && !self.state_queried {
                         self.read_device_state().await;
+                    }
+                }
+
+                Message::AmbientStart => {
+                    if self.ambient.is_none() {
+                        let was_on = self.snapshot.on;
+                        self.ambient = Some(AmbientPreview {
+                            // Captured before anything is written: this is the
+                            // only record of what the strip was doing.
+                            restore: self.restore_points(),
+                            was_on,
+                            effect: self.snapshot.effect.clone(),
+                            suspended: false,
+                            suspended_lit: false,
+                        });
+                        // Published so Home Assistant shows the mode as the light's
+                        // effect, which is where somebody chose it.
+                        self.snapshot.effect = Some(crate::ambient::MODE_EFFECT.to_owned());
+
+                        // A preview that drives a dark strip is indistinguishable
+                        // from a sampler that has stopped, so wake it the way an
+                        // alert does — and put it back to sleep on the way out.
+                        if !was_on {
+                            match self.write_all(&[wire::power(true)]).await {
+                                Ok(()) => self.snapshot.on = true,
+                                Err(failure) => {
+                                    self.snapshot.last_error = Some(failure.error.to_string());
+                                }
+                            }
+                        }
+                        tracing::info!("ambient preview started");
+                        self.snapshot.preview = true;
+                    }
+                }
+
+                Message::Ambient {
+                    mut entries,
+                    mut brightness,
+                } => {
+                    // Only the newest colour is worth writing. The camera samples
+                    // faster than the link can carry, so anything already queued
+                    // behind this one is a colour the screen has moved past —
+                    // writing the backlog makes the strip lag by seconds while it
+                    // replays a history nobody asked for.
+                    let mut skipped = 0_u32;
+                    while let Ok(next) = rx.try_recv() {
+                        match next {
+                            Message::Ambient {
+                                entries: newer,
+                                brightness: level,
+                            } => {
+                                entries = newer;
+                                brightness = level;
+                                skipped += 1;
+                            }
+                            // Anything else keeps its place: it was queued after
+                            // this frame, so it is handled after it.
+                            other => deferred.push_back(other),
+                        }
+                    }
+                    self.snapshot.frames_skipped += u64::from(skipped);
+
+                    // No preview running means the page was closed mid-flight, or
+                    // a user command ended it. Either way this frame is stale.
+                    let driving = self
+                        .ambient
+                        .as_ref()
+                        .is_some_and(|preview| !preview.suspended);
+                    if driving {
+                        match command::frames(&Command::Segments {
+                            entries,
+                            brightness,
+                        }) {
+                            Ok(frames) => {
+                                // Acknowledged, deliberately. The strip accepts an
+                                // unacknowledged write at this characteristic and
+                                // then does nothing with it, and a frame that is
+                                // silently ignored is worse than one that is slow:
+                                // the counters say the preview is healthy while the
+                                // light sits still. Dropping the backlog, not the
+                                // acknowledgement, is what removes the lag.
+                                if let Err(failure) = self.write_all(&frames).await {
+                                    self.snapshot.last_error = Some(failure.error.to_string());
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!(%err, "ambient frame could not be encoded")
+                            }
+                        }
+                    }
+                }
+
+                Message::AmbientSuspend => {
+                    if let Some(preview) = self.ambient.as_mut()
+                        && !preview.suspended
+                    {
+                        preview.suspended = true;
+                        preview.suspended_lit = self.snapshot.on;
+                        // Dark now, and re-lit on resume: whatever the strip was
+                        // showing would be light landing on the screen the
+                        // measurement is trying to describe.
+                        if self.snapshot.on {
+                            if let Err(failure) = self.write_all(&[wire::power(false)]).await {
+                                self.snapshot.last_error = Some(failure.error.to_string());
+                            }
+                            self.snapshot.on = false;
+                        }
+                        tracing::info!("ambient preview suspended for a measurement");
+                    }
+                }
+
+                Message::AmbientResume => {
+                    if let Some(preview) = self.ambient.as_mut()
+                        && preview.suspended
+                    {
+                        preview.suspended = false;
+                        if preview.suspended_lit {
+                            if let Err(failure) = self.write_all(&[wire::power(true)]).await {
+                                self.snapshot.last_error = Some(failure.error.to_string());
+                            }
+                            self.snapshot.on = true;
+                        }
+                        tracing::info!("ambient preview resumed");
+                    }
+                }
+
+                Message::AmbientStop => {
+                    if let Some(preview) = self.ambient.take() {
+                        let frames = if preview.was_on {
+                            preview.restore.lit
+                        } else {
+                            preview.restore.dark
+                        };
+                        if let Err(failure) = self.write_all(&frames).await {
+                            self.snapshot.last_error = Some(failure.error.to_string());
+                        }
+                        self.snapshot.on = preview.was_on;
+                        self.snapshot.effect = preview.effect.clone();
+                        self.snapshot.preview = false;
+                        tracing::info!("ambient preview stopped; strip restored");
                     }
                 }
 
@@ -806,10 +1018,34 @@ impl<L: Link> Worker<L> {
         }
 
         for frame in frames {
-            match self.link.write(frame).await {
+            // `Busy` means the stack still has the previous write in flight. It is
+            // the one failure that says nothing about the link, so it is retried
+            // rather than counted: a camera frame arriving while the last one is
+            // still on air is the normal case, not an error.
+            let mut attempt = 0;
+            let written = loop {
+                match self.link.write(frame).await {
+                    Ok(()) => break Ok(()),
+                    Err(LinkError::Busy(_)) if attempt < BUSY_RETRIES => {
+                        attempt += 1;
+                        tokio::time::sleep(BUSY_RETRY).await;
+                    }
+                    Err(err) => break Err(err),
+                }
+            };
+
+            match written {
                 Ok(()) => {
                     self.snapshot.writes_sent += 1;
                     self.last_traffic = self.now;
+                    self.snapshot.connected = true;
+                }
+                Err(LinkError::Busy(err)) => {
+                    // Still busy after every retry: the frame is stale by now, and
+                    // dropping it is exactly what the ambient path does anyway. The
+                    // link is left alone.
+                    self.snapshot.last_error = Some(format!("busy: {err}"));
+                    return Ok(());
                 }
                 Err(err) => {
                     // The link was up and would not take the write. This is the
@@ -910,6 +1146,9 @@ mod tests {
         /// Writes to reject, counting down. The write is refused *before* it is
         /// recorded, so the reply is not a lie about what reached the device.
         fail_writes: u32,
+        /// Writes to answer with `Busy`, counting down. Models BlueZ telling us
+        /// the previous write is still on air.
+        busy_writes: u32,
         /// What a state query answers, if anything. `None` models a strip that
         /// never replies, which is what a real timeout looks like here.
         report: Option<StateReport>,
@@ -967,6 +1206,10 @@ mod tests {
                     state.fail_writes -= 1;
                     return Err(LinkError::Write("write failed".into()));
                 }
+                if state.busy_writes > 0 {
+                    state.busy_writes -= 1;
+                    return Err(LinkError::Busy("In Progress".into()));
+                }
                 if frame.get(1) == Some(&ID_QUERY_STATE) {
                     state.queries += 1;
                 } else {
@@ -1011,6 +1254,14 @@ mod tests {
     fn brightness(level: u16) -> Batch {
         Batch {
             commands: vec![Command::Brightness(level)],
+        }
+    }
+
+    /// One ambient frame, coloured so that which one was written is visible.
+    fn ambient(red: u8) -> Message {
+        Message::Ambient {
+            entries: vec![(50, 0, red); 20],
+            brightness: 1000,
         }
     }
 
@@ -1948,6 +2199,111 @@ mod tests {
         .await;
 
         assert_eq!(snapshot.effect.as_deref(), Some("Superfluid"));
+    }
+
+    #[tokio::test]
+    async fn only_the_newest_queued_ambient_frame_is_written() {
+        // The camera samples faster than the link can carry. Writing the backlog
+        // makes the strip replay a history the screen has already left behind, so
+        // the queue is drained and only the last frame survives.
+        let (link, _) = FakeLink::new(0);
+        let state = drain(
+            Worker::new(link),
+            vec![Message::AmbientStart, ambient(10), ambient(20), ambient(30)],
+        )
+        .await;
+
+        let state = state.lock().unwrap();
+        // One write to wake the strip, then exactly one frame: the last one.
+        assert_eq!(state.writes.len(), 2, "three frames, one write");
+        let last = state.writes.last().expect("a frame was written");
+        assert!(
+            // Segments go out as (lightness, hue high, hue low, saturation), so
+            // the third frame's saturation of 30 is what identifies it.
+            last.windows(4).any(|window| window == [50, 0, 0, 30]),
+            "the surviving frame must be the newest, got {last:02x?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_measurement_darkens_the_strip_and_drops_the_frames_it_would_show() {
+        // The strip is a light source pointed at the screen being measured. In a
+        // dark room its own output is most of what the camera sees, so a
+        // measurement taken with it lit describes the strip rather than the panel.
+        let (link, _) = FakeLink::new(0);
+        let (state, _) = drain_paced(
+            Worker::new(link),
+            vec![
+                Message::AmbientStart,
+                Message::AmbientSuspend,
+                ambient(30),
+                Message::AmbientResume,
+                ambient(60),
+            ],
+        )
+        .await;
+
+        let state = state.lock().unwrap();
+        // Wake, darken, relight, and exactly one colour frame.
+        assert_eq!(
+            state.writes.len(),
+            4,
+            "expected power on, power off, power on, one frame"
+        );
+
+        let frames: Vec<_> = state
+            .writes
+            .iter()
+            .filter(|frame| frame.get(1) == Some(&0x0d))
+            .collect();
+        assert_eq!(frames.len(), 1, "the frame sent while suspended is dropped");
+        assert!(
+            frames[0].windows(4).any(|window| window == [50, 0, 0, 60]),
+            "the surviving frame is the one sent after the resume, got {:02x?}",
+            frames[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_preview_is_published_until_a_command_takes_the_strip_over() {
+        // The page keeps drawing colours either way, so this flag is the only
+        // thing that can tell an operator their colours are going nowhere.
+        let (link, _) = FakeLink::new(0);
+        let (_, previewing) =
+            drain_paced(Worker::new(link), vec![Message::AmbientStart, ambient(30)]).await;
+        assert!(previewing.preview, "the preview is driving the strip");
+
+        let (link, _) = FakeLink::new(0);
+        let (_, taken) = drain_paced(
+            Worker::new(link),
+            vec![Message::AmbientStart, Message::Batch(brightness(500))],
+        )
+        .await;
+        assert!(!taken.preview, "a user command ends the preview");
+    }
+
+    #[tokio::test]
+    async fn a_busy_write_is_retried_rather_than_called_a_drop() {
+        // BlueZ answers `InProgress` when a second write arrives before the first
+        // has been acknowledged. Nothing is lost, and the link is intact — but
+        // treating it as a drop marks the link down forever, because the handle is
+        // still open so nothing ever re-attaches. That is the failure that stops a
+        // preview dead while the page keeps drawing colours.
+        let (link, state) = FakeLink::new(0);
+        state.lock().unwrap().busy_writes = 2;
+
+        let (state, _) =
+            drain_paced(Worker::new(link), vec![Message::Batch(brightness(500))]).await;
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.attaches, 1,
+            "a busy write is not a reason to re-attach"
+        );
+        assert!(
+            !state.writes.is_empty(),
+            "the command must land once the stack is free"
+        );
     }
 
     #[tokio::test]

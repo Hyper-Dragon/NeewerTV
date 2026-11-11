@@ -1,6 +1,6 @@
 [package]
 name = "neewertv"
-version = "0.1.6"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -16,6 +16,10 @@ anyhow = "1"
 axum = "0.8"
 btleplug = "0.11"
 futures = "0.3"
+# MJPEG frames arrive as JPEGs and the sampler needs pixels, so this has to
+# decode them. Pure Rust, like the capture side below, which keeps the arm64
+# and amd64 builds identical and lets them stay C-free at build time.
+jpeg-decoder = "0.3"
 rumqttc = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,6 +29,13 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = "1"
+
+# Capture is V4L2, which exists only on Linux. Gating it by target rather than by
+# feature means `cargo test` and `clippy` still work on a Windows or macOS
+# checkout, where the ambient modules compile down to a clear "not supported"
+# instead of failing to resolve the syscall bindings.
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l = "0.14"
 
 [profile.release]
 # Size over raw speed: this is an I/O-bound bridge, and a smaller image is worth

@@ -13,7 +13,7 @@ small container that talks to it over Bluetooth and puts it on MQTT, so Home
 Assistant gets a light entity, your automations get something to talk to, and the
 vendor app gets to retire quietly.
 
-```
+```text
   Home Assistant  ──┐                            ┌── Bluetooth ──► strip
   your scripts    ──┼──► MQTT broker ──► neewertv ─┘
   the web UI      ──┘        ▲                 │
@@ -48,6 +48,10 @@ What you get:
   button on the device page, so a doorbell needs no automation at all.
 - **Per-segment colour**, if you're that way inclined. It's 20 addressable zones,
   not one bulb.
+- **Ambient sync from a camera**, pointed at the screen: twenty zones sampled from
+  what is actually on the panel, as a `TV Ambient` effect you can pick and forget.
+  No screen capture, no display-server access — see [Ambient
+  calibration](#ambient-calibration).
 - **A status page** with the daemon's own log tail, for when the light does
   something odd and you would rather not go digging in `docker logs`.
 - **No cloud, no account, no telemetry.** It talks to your broker and to nowhere
@@ -71,7 +75,7 @@ They can be in the same room, different rooms, or different buildings. The only
 link between them is MQTT, so if both can reach the broker, nothing else matters:
 no shared host, no add-on, no extra port to forward, no VPN between the two.
 
-```
+```text
   Home Assistant ──┐
   your scripts   ──┼──► MQTT broker ──► neewertv ──► Bluetooth ──► strip
   the web page   ──┘                          ↑
@@ -231,6 +235,10 @@ device appears under **Settings → Devices & Services → MQTT** as **TV Backli
 with no manual YAML and no restart. Power, brightness, colour and every effect are
 on the entity's card.
 
+Where a calibration exists, `TV Ambient` is appended to that effect list. It is not
+a firmware effect: choosing it hands the strip to the camera and choosing anything
+else hands it back. Nothing extra to install and nothing to add to `configuration.yaml`.
+
 There is also a status page at <http://localhost:8080/>, which has a link back
 here, because eventually someone finds it open in a browser with no idea what it
 is.
@@ -319,7 +327,7 @@ variable you got wrong. Same values whether you put them in `.env` or straight i
 the compose file.
 
 | Variable | Default | What it does |
-|---|---|---|
+| --- | --- | --- |
 | `MQTT_HOST` | **required** | Broker hostname or IP. |
 | `MQTT_PORT` | `1883` | Broker port. |
 | `MQTT_USERNAME` | — | Broker username. |
@@ -334,11 +342,112 @@ the compose file.
 | `BLE_DEVICE_ADDRESS` | — | Which strip this container owns, when more than one matches. Leave it unset with a single strip. |
 | `BLE_SCAN_SECONDS` | `12` | How long to scan before concluding the strip isn't there. Raise it if yours is slow to advertise. |
 | `BLE_KEEPALIVE_SECONDS` | `20` | Poke an idle link this often. These strips have been seen closing a connection they've heard nothing on — about 41 seconds, measured — so the default sits comfortably inside that window. It isn't a cure for every drop: links have also been lost at 344 s and 40 s with the keep-alive running. Lower it if yours is more impatient; `0` sends nothing. |
-| `WEB_INTERFACE` | `observe` | `off` or `observe`. Observe serves the status page and the log tail; there is no control surface, because MQTT already is one. |
+| `WEB_INTERFACE` | `observe` | `off`, `observe` or `ambient`. Observe serves the status page and the log tail; there is no control surface for the light, because MQTT already is one. `ambient` adds the camera calibration screen — see [Ambient calibration](#ambient-calibration). |
 | `WEB_BIND` | `0.0.0.0:8080` | Where the web page listens. |
+| `AMBIENT_CAMERA` | `/dev/video0` | The V4L2 device the ambient sampler reads. Only used when ambient capture is on. |
+| `AMBIENT_CALIBRATION` | `/data/ambient-calibration.json` | Where the four clicked corners live. Put it on a volume, or you re-click after every update. |
+| `AMBIENT_MAX_FPS` | `15` | Upper bound on samples per second, `0` for no bound. It bounds the work on a small box with an eager camera; the Bluetooth link cannot carry more than this anyway. |
 | `LOG_LEVEL` | `info` | A `tracing` directive, so `info,neewertv::ble=debug` works. |
 | `LOG_FORMAT` | `text` | `text`, or `json` if you're shipping logs somewhere. |
 | `DBUS_SYSTEM_BUS_ADDRESS` | — | Set to `unix:path=/run/dbus/system_bus_socket` inside the container. The compose file does it for you. |
+
+## Ambient calibration
+
+> **Experimental.** Capture, geometry, sampling and calibration all run, and the
+> strip follows the camera either while the calibration page is open or, once a
+> calibration exists, as a persistent mode that survives a restart.
+> Details and the geometry: [`docs/AMBIENT.md`](docs/AMBIENT.md).
+
+A camera pointed at the screen, four clicked corners, and twenty sampled colours —
+one per addressable segment. No screen capture and no display-server access: the
+container owns the camera, and the browser is only used for the one-off calibration.
+
+```yaml
+services:
+  neewertv:
+    environment:
+      WEB_INTERFACE: ambient
+    devices:
+      - /dev/video0:/dev/video0
+    volumes:
+      - ./data:/data
+```
+
+Open `/calibrate`, click the four corners of the screen — top-left, top-right,
+bottom-right, bottom-left — and save. The calibration is written to
+`AMBIENT_CALIBRATION` and read back on every start, so a camera that never moves is
+only calibrated once.
+
+Then set the camera up from the flat fields, which is the part that turns a camera
+into an instrument. Play a white field full-screen — a white-screen video works, and
+there are ten-hour ones on YouTube — and press **Auto-calibrate camera**: it pins the
+white balance, steps the exposure until the white field lands in a usable window, and
+stores the white field so a uniform screen reads uniform — the camera's lens
+shading, its angle and the light in the room stop showing up as a pale band down
+one side. Then play the black field and press **Measure black**, which finds the
+floor the camera reports with nothing on screen. Auto-calibration never looks at
+black, and a black field measured at a different exposure describes a different
+camera. **Measure white** is still there for a camera with no absolute exposure
+control, where auto-calibration cannot run.
+
+The three strip tuning values — black level, colour gain, light gain — are on the
+same page, next to swatches drawn from the exact `(lightness, hue, saturation)`
+triples the strip is sent. They are stored **in the calibration file**, not in the
+environment: they are judgements about this screen and this strip, made while
+looking at both, and they move with the calibration rather than with the compose
+file. Re-saving the corners never discards them.
+
+Three more clamp the result rather than shaping it: **max brightness** (a strip
+brighter than the panel it is imitating), **base glow** (one that never quite
+lights — it defaults to 1 because the strip's bottom end is not linear), and
+**smoothing** (0.2 by default, capped at 0.95 — at 1.0 nothing ever arrives and the
+strip freezes, which looks exactly like a crashed daemon).
+
+The page also lists **the camera's own controls** — gain, exposure, white balance,
+power-line frequency. Pin gain and exposure there instead of turning the television
+down: a camera that re-exposes between the white field and the black field is two
+different instruments, and the flat field it produces corrects the wrong thing.
+Those values are stored with the calibration and applied when the camera opens.
+
+While the page is open the status line reports both rates — frames sampled and
+writes delivered to the strip. They are not the same number, and the second one is
+the one you can see.
+
+**While the calibration page is open, the strip follows the camera** — twenty
+segments, at the brightness the light is already set to. Leaving the page puts the
+strip back exactly as it was, including switching it off again if it was off. That
+lifetime is the preview stream: no timers, and a browser that vanishes takes the
+preview with it.
+
+### Ambient mode
+
+A preview that needs a browser open is not the same thing as a light in ambient
+mode. Once a calibration exists, **`TV Ambient` appears in the light's effect list**
+in Home Assistant, alongside the hardware effects. Pick it and the strip follows the
+camera with nothing else running — no page, no browser, survived across a restart
+and a power cut.
+
+Pick **anything else** — a colour, a brightness, another effect, off — and the mode
+stops first, so a camera frame cannot overwrite the colour you just chose. The mode
+is remembered in the calibration file, which is the only thing that outlives both a
+daemon restart and the strip forgetting everything.
+
+**Home Assistant is the only place the mode can be set.** The calibration page has a
+switch of its own, but it is not the same thing: it is an override for as long as the
+page is open, so you can see what you are tuning. It writes nothing and publishes
+nothing, and closing the page hands the strip straight back to Home Assistant. That
+is deliberate — a browser tab should never be able to leave the light in a state
+nobody asked for.
+
+If `TV Ambient` is missing from the effect list, there is no calibration file yet.
+
+The camera's indicator goes **off** whenever nothing wants frames.
+
+Then set `WEB_INTERFACE` back to `observe` or `off` if you would rather not serve
+the page: the sampler keeps running from the saved calibration either way.
+
+It needs Linux (V4L2) and a camera that offers MJPEG or YUYV at 640×480. The
+container runs as root, so the device node needs no group.
 
 ## Known Issues
 
@@ -358,7 +467,9 @@ the compose file.
   one family tidied up where the original was actively confusing. The vendor's
   `Two-Way Off` is really the *base* TV Screen preset with the split switched off,
   so it is published as `TV Screen`, with `TV Screen (two-way)` and
-  `TV Screen (two-way, mirrored)` beside it.
+  `TV Screen (two-way, mirrored)` beside it. The published order leads with
+  `TV Ambient` when there is a calibration, then that family, because a list of
+  fifty names is read from the top.
 - **`unavailable` means the radio, not the app.** Availability follows the
   Bluetooth link rather than the process, so a strip that is switched off at the
   wall reads as unavailable. That is deliberate — it genuinely cannot be
@@ -373,6 +484,19 @@ the compose file.
   lasted.
 
 ## Version History
+
+**v0.2.1** — ambient mode. Point a camera at the television and the strip follows
+what is on it: twenty zones from twenty parts of the panel, with nothing but a camera
+node passed into the container — no screen capture, no display server, no second
+machine. It arrives as a `TV Ambient` effect at the top of the light's effect list, so
+it is one pick and it stays picked across a restart and a power cut, and any other
+command hands the strip straight back to you.
+
+Setup is four clicked corners and two flat fields, one white and one black. The page
+does the rest: it pins the camera's white balance, finds an exposure that is not
+blowing the highlights, and measures what the room and the lens are adding so it can
+be taken away again. It is experimental, and the page says so in the heading rather
+than in a footnote.
 
 **v0.1.6** — alerts on a dark strip. An alert fired at a strip that was switched
 off now switches it on, flashes, and switches it off again — and before the power

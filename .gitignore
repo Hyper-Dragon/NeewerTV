@@ -32,6 +32,11 @@ rustc-ice-*.txt
 
 # Scratch space for throwaway scripts and captured logs.
 .scratch/
+ai_scratchspace/
+.markdownlint-tmp.jsonc
 
 # Local build artefacts from the WSL toolchain.
 target-wsl/
+
+# local CI watchers and scratch scripts
+.scratch-*

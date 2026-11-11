@@ -22,10 +22,15 @@ jobs:
       # outright without dbus-1.pc. The container image installs these; a bare
       # cargo job on a fresh runner has neither, and the failure arrives as a
       # build-script panic rather than anything that mentions Bluetooth.
+      #
+      # clang/libclang-dev serve the same purpose for `v4l2-sys-mit`, which runs
+      # bindgen over videodev2.h at build time. Runners happen to ship libclang
+      # today; naming it here means the job does not depend on that luck.
       - name: System dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+          sudo apt-get install -y --no-install-recommends \
+            libdbus-1-dev pkg-config clang libclang-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:

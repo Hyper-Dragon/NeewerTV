@@ -32,6 +32,16 @@ pub enum LinkError {
     #[error("write: {0}")]
     Write(String),
 
+    /// The stack is still busy with the previous write.
+    ///
+    /// BlueZ answers `org.bluez.Error.InProgress` when a second write arrives
+    /// before the first has been acknowledged on air. It is a queueing answer,
+    /// not a failure: nothing is lost and the link is intact. Treating it as a
+    /// drop is what stops the daemon writing anything at all — it marks the link
+    /// down, and because the handle is still open it never re-attaches.
+    #[error("busy: {0}")]
+    Busy(String),
+
     #[error("no state report within {0:?}")]
     NoReply(Duration),
 
@@ -48,7 +58,12 @@ pub trait Link: Send {
     /// handle refers to an object the Bluetooth stack has already destroyed.
     fn attach(&mut self) -> BoxFuture<'_, Result<(), LinkError>>;
 
-    /// Write one complete frame.
+    /// Write one complete frame, and wait for the strip to acknowledge it.
+    ///
+    /// Acknowledged only, deliberately. The characteristic advertises Write
+    /// Without Response and accepts those without complaint, but the strip does
+    /// not act on them: every frame is counted as sent and the light does not
+    /// move. A faster write that is silently ignored is not faster.
     fn write<'a>(&'a mut self, frame: &'a [u8]) -> BoxFuture<'a, Result<(), LinkError>>;
 
     /// Wait for the next `0x09` state report, ignoring anything else.

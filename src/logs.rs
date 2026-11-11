@@ -18,6 +18,15 @@ use tracing_subscriber::fmt::MakeWriter;
 /// enough that the page stays responsive.
 const CAPACITY: usize = 250;
 
+/// How long one line may get before it is broken in two.
+///
+/// `CAPACITY` bounds the *number* of lines, which bounds this buffer only while
+/// lines end. A writer that emits text and never a newline — a progress indicator, a
+/// crash dump, a driver logging a buffer — would otherwise grow a single `String`
+/// until the process died, which in something meant to run for months is a leak
+/// with no symptom until it is one. Four kilobytes is a screenful at any font size.
+const MAX_LINE: usize = 4 * 1024;
+
 /// One buffer shared by the logger and the HTTP handlers.
 #[derive(Clone)]
 pub struct LogBuffer {
@@ -66,16 +75,27 @@ impl LogBuffer {
 
         for character in text.chars() {
             if character == '\n' {
-                let line = std::mem::take(&mut inner.partial);
-                if !line.is_empty() {
-                    inner.lines.push_back(line);
-                    if inner.lines.len() > CAPACITY {
-                        inner.lines.pop_front();
-                    }
-                }
+                inner.commit();
             } else {
                 inner.partial.push(character);
+                if inner.partial.len() >= MAX_LINE {
+                    inner.commit();
+                }
             }
+        }
+    }
+}
+
+impl Inner {
+    /// Move whatever has been written so far into the ring as one line.
+    fn commit(&mut self) {
+        if self.partial.is_empty() {
+            return;
+        }
+        let line = std::mem::take(&mut self.partial);
+        self.lines.push_back(line);
+        if self.lines.len() > CAPACITY {
+            self.lines.pop_front();
         }
     }
 }
@@ -166,6 +186,29 @@ mod tests {
         assert!(
             !lines.iter().any(|line| line == "line 0"),
             "the oldest line was dropped"
+        );
+    }
+
+    #[test]
+    fn a_writer_that_never_sends_a_newline_cannot_grow_the_buffer() {
+        // The ring bounds the number of lines; this bounds their length. Without
+        // both, one very long write is an unbounded allocation in a process that
+        // is meant to stay up for months.
+        let buffer = LogBuffer::new();
+        let flood = "x".repeat(MAX_LINE * 3 + 17);
+        buffer.push(&flood);
+
+        let lines = buffer.snapshot();
+        assert!(!lines.is_empty(), "nothing was kept at all");
+        assert!(
+            lines.iter().all(|line| line.len() <= MAX_LINE),
+            "a line longer than {MAX_LINE} survived: {:?}",
+            lines.iter().map(String::len).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            lines.iter().map(String::len).sum::<usize>(),
+            flood.len(),
+            "text was dropped rather than split"
         );
     }
 

@@ -20,8 +20,15 @@ after an alert.
 | ✅ | MQTT light: state, `set`, availability, HA discovery | done, verified on hardware |
 | ✅ | Effects: presets, scenes, DIY patterns, per-segment colour | done |
 | ✅ | Alerts: fire a pattern, then put the strip back | done, verified on hardware |
+| ✅ | Ambient: camera, zones, flat field, `TV Ambient` effect | done, verified on hardware |
+| ✅ | Calibration page: preview, zone map, swatches, camera controls, diagnostics | done |
 | ✅ | Web interface: status page and log tail, read-only | done |
 | ✅ | Images: `linux/amd64` and `linux/arm64`, each built natively | done |
+
+Ambient capture is the one part still marked **experimental**. It works, it is tested
+against one camera and one panel, and its tuning values are judgements made in front
+of that panel rather than measurements of the hardware's own transfer curve. If it
+looks wrong, [AMBIENT.md](AMBIENT.md) is the longer read.
 
 ## Why this exists at all
 

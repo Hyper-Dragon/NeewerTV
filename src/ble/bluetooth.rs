@@ -18,7 +18,7 @@
 use std::pin::Pin;
 use std::time::Duration;
 
-use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
+use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::{Stream, StreamExt as _};
 
@@ -207,6 +207,23 @@ async fn prepare(
 
     let write_char = find_characteristic(device, WRITE_UUID)?;
     let notify_char = find_characteristic(device, NOTIFY_UUID)?;
+
+    let unacknowledged = write_char
+        .properties
+        .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE);
+    // Logged rather than acted on. The characteristic claims to accept
+    // unacknowledged writes and does accept them, then ignores them: the counter
+    // climbed and the light did not move. So the flag is a fact about the device
+    // worth recording, not a path worth taking.
+    tracing::info!(
+        unacknowledged,
+        "write characteristic properties: {}",
+        if unacknowledged {
+            "acknowledged and unacknowledged writes"
+        } else {
+            "acknowledged writes only"
+        }
+    );
 
     device
         .subscribe(&notify_char)
@@ -449,12 +466,21 @@ impl Link for BluetoothLink {
                 .as_ref()
                 .ok_or_else(|| LinkError::Write("no write characteristic".to_owned()))?;
 
-            match tokio::time::timeout(
-                WRITE_TIMEOUT,
-                device.write(write_char, frame, WriteType::WithResponse),
-            )
-            .await
+            // Always a Write Request. The strip advertises Write Without Response
+            // and accepts those, then ignores them: the writes were counted as
+            // delivered and the light sat still.
+            let write_type = WriteType::WithResponse;
+
+            match tokio::time::timeout(WRITE_TIMEOUT, device.write(write_char, frame, write_type))
+                .await
             {
+                // `InProgress` is BlueZ queueing, not a broken link. It has to be
+                // its own error or the worker cannot tell the two apart, and
+                // telling them apart is the difference between dropping one frame
+                // and stopping for good.
+                Ok(Err(err)) if err.to_string().contains("In Progress") => {
+                    Err(LinkError::Busy(err.to_string()))
+                }
                 Ok(result) => result.map_err(|err| LinkError::Write(err.to_string())),
                 Err(_) => Err(LinkError::Write(format!(
                     "no acknowledgement within {}s",

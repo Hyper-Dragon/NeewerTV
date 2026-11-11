@@ -82,10 +82,21 @@ services:
       ALERT_BUTTONS: ${ALERT_BUTTONS:-red,blue,green}
       ALERT_BUTTON_LENGTH: ${ALERT_BUTTON_LENGTH:-10}
 
-      # off | observe. `observe` serves the status page and the log tail and
-      # mounts nothing that can change the strip -- a route that does not exist
-      # cannot be reached by a mistake in an authorisation check.
+      # off | observe | ambient. `observe` serves the status page and the log tail
+      # and mounts nothing that can change the strip -- a route that does not exist
+      # cannot be reached by a mistake in an authorisation check. `ambient` adds the
+      # camera calibration screen, which writes a calibration file and nothing
+      # else; the light is still only driven over MQTT.
       WEB_INTERFACE: ${WEB_INTERFACE:-observe}
+      # Only read when ambient capture is on. The calibration is a single JSON file
+      # of four corners, and it has to outlive the container: the camera is mounted
+      # once and never moves, so re-clicking after an update would defeat the point.
+      # AMBIENT_CAMERA: /dev/video0
+      # AMBIENT_CALIBRATION: /data/ambient-calibration.json
+      # Samples per second, 0 for no cap. The bluetooth link cannot carry more
+      # than about this anyway, and a cap keeps an old camera from eating a small
+      # box's CPU.
+      # AMBIENT_MAX_FPS: 15
       # Where the page listens inside the container. Leave it alone unless the
       # default clashes with something else in the container; to move it on the
       # host, change WEB_PORT below instead.
@@ -97,6 +108,15 @@ services:
       # A single socket, not /run/dbus. Mounting the directory hands the
       # container every bus on the host.
       - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      # Only for `WEB_INTERFACE=ambient`: where the calibration file lives, so it
+      # survives a container update.
+      # - ./data:/data
+
+    # Only for `WEB_INTERFACE=ambient`. The container already runs as root, so the
+    # device node needs no group; if you change `user:` above, add the host's
+    # `video` group as well or VIDIOC calls fail with EACCES.
+    # devices:
+    #   - /dev/video0:/dev/video0
 
     ports:
       - "${WEB_PORT:-8080}:8080"

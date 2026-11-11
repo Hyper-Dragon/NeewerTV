@@ -5,6 +5,7 @@
 //! adapter. In particular [`protocol`] is pure: it turns intent into bytes and
 //! bytes into state, and touches nothing else.
 
+pub mod ambient;
 pub mod app;
 pub mod ble;
 pub mod config;

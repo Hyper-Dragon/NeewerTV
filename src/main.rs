@@ -41,9 +41,198 @@ fn build_version() -> String {
     }
 }
 
+/// Whether ambient capture has anything to do.///
+/// Two independent reasons to run: the calibration screen is being served, or a
+/// calibration has already been saved and the sampler should use it. The second
+/// is what lets the operator calibrate once and then drop back to `observe` or
+/// `off` without turning the feature off.
+fn ambient_enabled(config: &Config) -> bool {
+    config.web.permits_calibration() || config.ambient.calibration.exists()
+}
+
+/// Follow the camera for as long as somebody is looking at the calibration page.
+///
+/// Nothing here decides *what* the strip should be doing; it only reports what the
+/// camera sees while the page is open, and tells the worker when the page opens
+/// and closes. The worker owns the restoring, because it is the only thing that
+/// knows what the strip was doing before.
+fn spawn_ambient_bridge(
+    ambient: neewertv::ambient::Handle,
+    commands: mpsc::Sender<Message>,
+    snapshot: watch::Receiver<Snapshot>,
+) {
+    tokio::spawn(async move {
+        let mut watching = ambient.watching();
+        let mut measuring = ambient.measuring();
+        let mut mode = ambient.mode_changes();
+        let mut latest = ambient.latest_changes();
+        let mut measuring_now = false;
+
+        // A command from the user takes the strip away from the preview. That is
+        // right, but it must not be permanent: the page goes on drawing colours
+        // that nobody can see. Once they have stopped commanding, the preview
+        // takes the strip back.
+        let mut quiet_since = tokio::time::Instant::now();
+        let mut last_commands = snapshot.borrow().commands_received;
+        let mut recheck = tokio::time::interval(PREVIEW_RECHECK);
+        recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = recheck.tick() => {}
+                changed = watching.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                changed = measuring.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                changed = mode.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                changed = latest.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            // The worker is the one that knows: it publishes whether the strip is
+            // being driven, which stays false after a command until somebody asks
+            // for it again.
+            // Read once: `borrow_and_update` clears the change flag, so a second
+            // read in the same pass would miss a transition.
+            let standing = *mode.borrow_and_update();
+            let page_open = *watching.borrow_and_update();
+            // Two different things, and only one of them is an instruction:
+            //
+            // * `standing` is the mode Home Assistant set, written to the
+            //   calibration file, and it drives the strip with no browser anywhere.
+            // * the page's own switch is an override for the page — somebody has to
+            //   be looking at the calibration screen for it to mean anything, and
+            //   closing that screen hands the strip straight back to Home
+            //   Assistant. Nothing a browser leaves behind outlives the browser.
+            let mode_on = standing || (page_open && ambient.page_mode());
+            let published = snapshot.borrow().clone();
+            if published.commands_received != last_commands {
+                last_commands = published.commands_received;
+                quiet_since = tokio::time::Instant::now();
+            }
+            let previewing = published.preview;
+            // Ambient mode is a standing instruction to drive the strip, so it is
+            // taken back at once. A colour command clears the mode first, so there
+            // is nothing for it to fight.
+            let settled = mode_on || quiet_since.elapsed() >= PREVIEW_QUIET;
+
+            // A flat field is measured with the strip dark: the light that would
+            // otherwise land on the screen is the strip's own, and it would be
+            // read as part of the screen. The preview is suspended rather than
+            // stopped, so it keeps the restore point it captured.
+            let now_measuring = *measuring.borrow_and_update();
+            if previewing && now_measuring != measuring_now {
+                let message = if now_measuring {
+                    Message::AmbientSuspend
+                } else {
+                    Message::AmbientResume
+                };
+                if commands.send(message).await.is_err() {
+                    break;
+                }
+            }
+            measuring_now = now_measuring;
+
+            // Taking the strip over before there is anything to put on it would
+            // switch the light on and show nothing, so the preview waits for the
+            // first calibrated reading — which is what happens when the operator
+            // saves a calibration from the page they already have open. A
+            // measurement does not end the preview: it only stops the frames.
+            // The page is a preview lease; the standing mode survives the browser
+            // being closed, and the page's override does not.
+            let wanted = (page_open || mode_on)
+                && latest
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|reading| reading.calibrated);
+
+            if previewing && !wanted {
+                if commands.send(Message::AmbientStop).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+
+            if wanted && !previewing {
+                if settled && commands.send(Message::AmbientStart).await.is_err() {
+                    break;
+                }
+                // Nothing to send yet: the start is what re-arms it, and the next
+                // pass will find the preview running.
+                continue;
+            }
+
+            if !wanted || !previewing || now_measuring {
+                continue;
+            }
+
+            let Some(reading) = latest.borrow_and_update().clone() else {
+                continue;
+            };
+            if !reading.calibrated {
+                continue;
+            }
+
+            // The user's brightness is a scale, not something the preview takes
+            // over: twenty segments at full blast in a dark room is not what the
+            // slider is for. The calibration can put a ceiling under it, so a
+            // backlight that should never light the room up stays that way even
+            // when somebody drags the slider to the top.
+            let ceiling = u32::from(reading.render.maximum_brightness.min(100)) * 10;
+            let brightness = snapshot
+                .borrow()
+                .brightness
+                .map_or(1000, |level| (u32::from(level) * 1000 + 127) / 255)
+                .min(ceiling) as u16;
+
+            let entries = neewertv::ambient::render::entries(&reading.colours, reading.render);
+
+            // Recorded here rather than in the sampler, because this is the only
+            // place that holds both ends of the transfer at once: what the camera
+            // reported and the exact triple that goes down the wire.
+            let mut wire = [[0_u16; 3]; neewertv::ambient::SEGMENTS];
+            for (slot, entry) in wire.iter_mut().zip(entries.iter().copied()) {
+                let (lightness, hue, saturation) = entry;
+                *slot = [u16::from(lightness), hue, u16::from(saturation)];
+            }
+            ambient.record_frame(neewertv::ambient::RecordedFrame {
+                ms: 0,
+                colours: reading.colours,
+                entries: wire,
+                clipped_zones: reading.clipped_zones,
+                brightness,
+                fps: reading.fps,
+            });
+
+            // Dropped rather than queued when the worker is behind: a colour from
+            // two frames ago is worse than no colour, and the link is slower than
+            // the camera by a wide margin.
+            match commands.try_send(Message::Ambient {
+                entries,
+                brightness,
+            }) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
+            }
+        }
+    });
+}
+
 /// The flag the container's `HEALTHCHECK` invokes.
 const FLAG_HEALTHCHECK: &str = "--healthcheck";
-
 /// The status line a healthy probe must see.
 const HTTP_OK: &str = "HTTP/1.1 200";
 
@@ -60,6 +249,18 @@ const BODY_OK: &str = "\"status\":\"ok\"";
 /// so this is comfortably finer than the resolution that matters.
 const TICK: Duration = Duration::from_millis(250);
 
+/// How long the preview waits after the last user command before taking the
+/// strip back.
+///
+/// A command wins while it is being made — a slider drag is a stream of them —
+/// but a page left open with the strip frozen on one colour is a page that lies.
+const PREVIEW_QUIET: Duration = Duration::from_millis(1500);
+
+/// How often the ambient bridge looks again when nothing has changed.
+///
+/// Everything else it waits on is an event; this exists so that "the user has
+/// stopped commanding" can be noticed at all.
+const PREVIEW_RECHECK: Duration = Duration::from_millis(400);
 fn main() -> anyhow::Result<()> {
     // Checked before the runtime starts so the probe costs a TCP connect, not a
     // whole tokio setup.
@@ -180,9 +381,39 @@ async fn run() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     spawn_signal_handler(shutdown.clone());
 
+    // Ambient capture needs V4L2, which only exists on Linux. Saying so at startup
+    // is the difference between "the camera is not plugged in" and "this build
+    // cannot see cameras at all".
+    if config.web.permits_calibration() && !cfg!(target_os = "linux") {
+        anyhow::bail!(
+            "WEB_INTERFACE=ambient needs Linux V4L2 capture, which this build does not have; \
+             use WEB_INTERFACE=observe here and run the calibration on the deployment host"
+        );
+    }
+
+    // The camera runs when it has something to do: either the operator is on the
+    // calibration page, or a calibration already exists — in which case sampling
+    // continues even with the page switched off, which is the whole point of
+    // calibrating a camera that never moves again.
+    let ambient = ambient_enabled(&config).then(|| {
+        neewertv::ambient::start(
+            config.ambient.camera.clone(),
+            config.ambient.calibration.clone(),
+            config.ambient.max_fps,
+            shutdown.clone(),
+        )
+    });
+
     // The worker owns the link; everything else holds a handle.
     let (command_tx, command_rx) = mpsc::channel::<Message>(32);
     let (snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
+
+    // While somebody has the calibration page open the strip follows the camera,
+    // and nothing else. The preview stream is the lease, so leaving the page is
+    // what puts the strip back.
+    if let Some(handle) = &ambient {
+        spawn_ambient_bridge(handle.clone(), command_tx.clone(), snapshot_rx.clone());
+    }
 
     let link = BluetoothLink::new(
         config.ble.name_match.clone(),
@@ -222,6 +453,7 @@ async fn run() -> anyhow::Result<()> {
         config.clone(),
         snapshot_rx.clone(),
         command_tx.clone(),
+        ambient.clone(),
         shutdown.clone(),
     ));
 
@@ -232,6 +464,7 @@ async fn run() -> anyhow::Result<()> {
         shutdown.clone(),
         logs.clone(),
         version.clone(),
+        ambient,
     ));
 
     // A failure in any one of these is fatal: a daemon that has lost its broker
@@ -303,6 +536,7 @@ async fn serve_web(
     shutdown: CancellationToken,
     logs: neewertv::logs::LogBuffer,
     version: String,
+    ambient: Option<neewertv::ambient::Handle>,
 ) -> anyhow::Result<()> {
     if !config.web.is_enabled() {
         tracing::info!("web interface disabled; MQTT only");
@@ -341,6 +575,7 @@ async fn serve_web(
         device_name: config.device.name.clone(),
         configured_address: config.ble.address.clone(),
         version,
+        ambient,
     });
 
     axum::serve(listener, app)
