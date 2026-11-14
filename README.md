@@ -69,7 +69,7 @@ It works on my machine. Your mileage may vary, and if it does, see
 </p>
 
 <p align="center">
-  <em>Demo captured using an old Microsoft Xbox 360 Live Vision webcam.</em>
+  <em>Demo driven by an old Microsoft Xbox 360 Live Vision webcam.</em>
 </p>
 
 **An old webcam is all you need to try it out.**
