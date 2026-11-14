@@ -62,7 +62,17 @@ It works on my machine. Your mileage may vary, and if it does, see
 
 ## Ambient Demo
 
-[![Ambient Demo](https://raw.githubusercontent.com/Hyper-Dragon/NeewerTV/main/docs/ambi-demo.gif)](https://raw.githubusercontent.com/Hyper-Dragon/NeewerTV/main/docs/ambi-demo.gif?v=2)
+<p align="center">
+  <a href="https://raw.githubusercontent.com/Hyper-Dragon/NeewerTV/main/docs/ambi-demo.gif">
+    <img src="https://raw.githubusercontent.com/Hyper-Dragon/NeewerTV/main/docs/ambi-demo.gif" alt="NeewerTV Ambient Mode Demo" width="600">
+  </a>
+</p>
+
+<p align="center">
+  <em>Demo captured using an old Microsoft Xbox 360 Live Vision webcam.</em>
+</p>
+
+**An old webcam is all you need to try it out.**
 
 ## Where does it run?
 
