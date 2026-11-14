@@ -236,6 +236,13 @@ pub struct Handle {
     /// the browser being closed belongs to Home Assistant. Cleared when the page is
     /// opened, so nobody inherits a switch they did not throw.
     page_mode: Arc<AtomicBool>,
+    /// Whether the strip the mode drives can be reached right now.
+    ///
+    /// Told to this module by whoever holds the link, because that is the only
+    /// thing that knows. Not a second mode: the standing instruction survives a
+    /// power cut untouched, and this only decides whether a camera is worth
+    /// running to feed a strip that is not listening.
+    strip: Arc<watch::Sender<bool>>,
     mode_change: Arc<watch::Sender<bool>>,
     /// Frames captured for the diagnostic download, and whether it is running.
     recorder: Arc<Mutex<Recorder>>,
@@ -449,6 +456,24 @@ impl Handle {
         self.page_mode.load(Ordering::Relaxed)
     }
 
+    /// Tell the ambient service whether the strip it drives can be reached.
+    ///
+    /// The mode is an instruction and stays set through a power cut, but a strip
+    /// that is not there has nothing for the camera to feed: the capture device is
+    /// released while this is off, so the indicator goes out, and it is reopened
+    /// when the link comes back. Nothing about the mode is stored or published
+    /// from here — a link that blinks must not look like a mode that ended.
+    pub fn set_strip(&self, reachable: bool) {
+        if *self.strip.borrow() == reachable {
+            return;
+        }
+        info!(
+            reachable,
+            "ambient capture follows the strip's link; the mode itself is unchanged"
+        );
+        let _ = self.strip.send(reachable);
+    }
+
     /// Drive the strip from the camera while the page is open, without touching the
     /// mode Home Assistant owns.
     ///
@@ -630,6 +655,10 @@ pub fn start(
     let mode = Arc::new(AtomicBool::new(mode_on));
     let (mode_tx, _) = watch::channel(mode_on);
     let mode_change = Arc::new(mode_tx);
+    // Believed reachable until the link says otherwise: the link is probing for
+    // the strip from the moment the process starts, and a camera that never opens
+    // because nobody has attached yet would have nothing to publish when it does.
+    let (strip_tx, strip_rx) = watch::channel(true);
 
     camera::spawn(
         device,
@@ -640,6 +669,7 @@ pub fn start(
             watching: viewing.change.subscribe(),
             measuring: measuring.change.subscribe(),
             ambient: mode_change.subscribe(),
+            strip: strip_rx,
         },
         shutdown.clone(),
     );
@@ -668,6 +698,7 @@ pub fn start(
         bypass: Arc::clone(&bypass),
         mode,
         page_mode: Arc::new(AtomicBool::new(false)),
+        strip: Arc::new(strip_tx),
         mode_change,
         recorder: Arc::new(Mutex::new(Recorder::default())),
         measure: measure_tx,

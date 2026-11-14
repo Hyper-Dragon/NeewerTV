@@ -40,6 +40,7 @@ impl Handle {
         let (_, latest) = watch::channel(None::<Arc<super::Latest>>);
         let (_, frames) = watch::channel(None::<Arc<super::Frame>>);
         let (mode_change, _) = watch::channel(false);
+        let (strip, _) = watch::channel(true);
         let (measure, _) = mpsc::channel(1);
 
         Self {
@@ -52,6 +53,7 @@ impl Handle {
             bypass: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             page_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            strip: Arc::new(strip),
             mode_change: Arc::new(mode_change),
             recorder: Arc::new(std::sync::Mutex::new(Recorder::default())),
             measure,

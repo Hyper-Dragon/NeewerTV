@@ -513,6 +513,21 @@ impl<L: Link> Worker<L> {
                         .as_ref()
                         .is_some_and(|preview| !preview.suspended);
                     if driving {
+                        // The mode is an instruction that the light is lit, and a
+                        // strip that lost its power comes back dark. Nothing else
+                        // would switch it on again — the wake-up on
+                        // `AmbientStart` happened before the cut — so the preview
+                        // would paint frames into a strip that stays off for as
+                        // long as the daemon runs. Learned from the state report
+                        // after a reconnect, so this is a fact and not a guess.
+                        if !self.snapshot.on {
+                            match self.write_all(&[wire::power(true)]).await {
+                                Ok(()) => self.snapshot.on = true,
+                                Err(failure) => {
+                                    self.snapshot.last_error = Some(failure.error.to_string());
+                                }
+                            }
+                        }
                         match command::frames(&Command::Segments {
                             entries,
                             brightness,
@@ -2261,6 +2276,37 @@ mod tests {
             frames[0].windows(4).any(|window| window == [50, 0, 0, 60]),
             "the surviving frame is the one sent after the resume, got {:02x?}",
             frames[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_strip_that_lost_its_power_is_relit_by_the_mode() {
+        // The mode outlives a power cut, by design, so the strip comes back dark
+        // with the preview still running. The wake-up on `AmbientStart` happened
+        // before the cut and never happens again, and colour frames do not carry
+        // power — so without this the preview paints into a strip that stays off
+        // for as long as the daemon runs, which looks exactly like a crashed
+        // camera. The state report after the reconnect is what makes it a fact.
+        let (link, state) = FakeLink::new(0);
+        state.lock().unwrap().report = Some(report_with_power(false));
+
+        let (state, snapshot) = drain_paced(
+            Worker::new(link),
+            vec![Message::AmbientStart, Message::Tick(1_000), ambient(40)],
+        )
+        .await;
+
+        assert!(snapshot.on, "the strip the mode drives is lit again");
+
+        let state = state.lock().unwrap();
+        let lit = state
+            .writes
+            .iter()
+            .filter(|frame| **frame == wire::power(true))
+            .count();
+        assert_eq!(
+            lit, 2,
+            "one to wake it when the preview began, one after the cut"
         );
     }
 

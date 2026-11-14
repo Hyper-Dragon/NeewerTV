@@ -237,18 +237,25 @@ pub fn spawn(
 /// A camera that is open is a camera that is streaming, and a streaming camera has
 /// its indicator on. An unused webcam glowing green in a dark room, permanently, is
 /// not acceptable — so the device is closed whenever the preview page is closed and
-/// no measurement is running.
+/// no measurement is running, and while the strip the mode drives is not there.
 #[derive(Clone)]
 pub struct Demand {
     pub watching: watch::Receiver<bool>,
     pub measuring: watch::Receiver<bool>,
     /// True while the strip is following the camera without a page open.
     pub ambient: watch::Receiver<bool>,
+    /// False while the strip that mode drives cannot be reached.
+    ///
+    /// Ambient capture exists to drive a strip. A strip whose power has been cut
+    /// is not listening, so a camera still pointed at the screen is a camera
+    /// nothing is watching for: the indicator stays on, the sampler burns a core
+    /// on colours that go nowhere, and every frame tries the dead link again.
+    pub strip: watch::Receiver<bool>,
 }
 
 impl Demand {
     /// True while somebody is looking, a field is being measured, or the strip is
-    /// in ambient mode.
+    /// in ambient mode and there to be driven.
     ///
     /// The guards are taken and dropped immediately: holding one across the sleep
     /// below would block whoever is trying to send the new value.
@@ -257,7 +264,11 @@ impl Demand {
         let watching = *self.watching.borrow();
         let measuring = *self.measuring.borrow();
         let ambient = *self.ambient.borrow();
-        watching || measuring || ambient
+        let strip = *self.strip.borrow();
+        // The page and the measurement keep the camera for their own sake — one
+        // needs an image to draw on, the other a field to measure — so only the
+        // mode has to be told apart from a strip that is not there.
+        watching || measuring || (ambient && strip)
     }
 }
 
@@ -591,5 +602,45 @@ mod tests {
         let (width, height, small) = halve(&image, 4, 2);
         assert_eq!((width, height), (2, 1));
         assert_eq!(small, vec![255, 0, 0, 255, 0, 0]);
+    }
+}
+
+/// What the capture thread should be doing, with each reason stated separately.
+///
+/// Only the mode has a second condition: the strip it drives has to exist for a
+/// frame to be worth taking.
+#[cfg(all(test, target_os = "linux"))]
+mod demand_tests {
+    use super::*;
+
+    fn demand(watching: bool, measuring: bool, ambient: bool, strip: bool) -> Demand {
+        Demand {
+            watching: watch::channel(watching).1,
+            measuring: watch::channel(measuring).1,
+            ambient: watch::channel(ambient).1,
+            strip: watch::channel(strip).1,
+        }
+    }
+
+    #[test]
+    fn ambient_mode_with_no_strip_leaves_the_camera_closed() {
+        // The defect this exists for: the strip's power is pulled, the mode is
+        // still set, and the camera goes on watching a screen for a light that
+        // is not there — indicator lit, frames sampled, every one of them
+        // trying the dead link again.
+        assert!(!demand(false, false, true, false).wanted());
+    }
+
+    #[test]
+    fn ambient_mode_with_the_strip_present_runs_the_camera() {
+        assert!(demand(false, false, true, true).wanted());
+    }
+
+    #[test]
+    fn the_page_and_a_measurement_want_frames_of_their_own() {
+        // The page needs an image to draw on whatever the strip is doing, and a
+        // field is measured with the strip off by design.
+        assert!(demand(true, false, false, false).wanted());
+        assert!(demand(false, true, false, false).wanted());
     }
 }

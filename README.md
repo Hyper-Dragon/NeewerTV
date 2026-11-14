@@ -441,7 +441,8 @@ nobody asked for.
 
 If `TV Ambient` is missing from the effect list, there is no calibration file yet.
 
-The camera's indicator goes **off** whenever nothing wants frames.
+The camera's indicator goes **off** whenever nothing wants frames — no page, no
+measurement, and no strip within reach to drive.
 
 Then set `WEB_INTERFACE` back to `observe` or `off` if you would rather not serve
 the page: the sampler keeps running from the saved calibration either way.

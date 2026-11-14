@@ -103,10 +103,25 @@ both a daemon restart and the strip forgetting everything across a power cycle.
 
 Any command from MQTT also ends a preview, for the same reason it ends the mode.
 
-**The camera is closed when nothing wants frames.** Both the lease and the mode feed
-one `Demand` value, and the capture task closes the device when neither is asking.
-That is what turns the camera's indicator off: a camera left open is a camera the
-operator can see is watching, and in ambient mode it is never idle anyway.
+**The camera is closed when nothing wants frames.** The preview lease, a measurement
+and the mode feed one `Demand` value, and the capture task closes the device when none
+of them is asking. That is what turns the camera's indicator off: a camera left open is
+a camera the operator can see is watching.
+
+Capture exists to drive the strip, so the mode counts for only as long as the strip is
+there. A strip whose power has been pulled — or that is out of range — releases the
+camera instead of leaving it pointed at a screen nothing follows, and stops a frame per
+camera tick being spent on a link that cannot be attached. The mode itself is not
+touched: it is a standing instruction, it survives a power cut, and the camera reopens
+with the link. The link has to stay down for twenty seconds before the camera is
+closed, because a link that blinks is not a strip that is gone, and stopping and
+starting the camera for every hiccup would blink the indicator and leave the page
+without frames.
+
+A strip that comes back from a power cut comes back dark, and a dark strip plus a
+running mode is colour frames written into a light that never comes on. The state
+report the daemon asks for on every connection is what says so, and the mode switches
+the strip back on.
 
 ## Geometry
 

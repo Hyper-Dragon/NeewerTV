@@ -6,7 +6,15 @@ All notable changes to this project. The format follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **Ambient mode kept the camera running after the strip's power was pulled.** The
+  camera follows the strip, not the mode on its own: when the link has been down for
+  twenty seconds the capture device is released, the indicator goes out, and the
+  sampler stops reading a screen nothing is following. The mode is left set — it has
+  to survive a power cut — and the camera comes back with the link. A strip that comes
+  back from a cut comes back dark, so the mode now switches it on again instead of
+  painting colour frames into a light that never comes on.
 
 ## [0.2.1] — 2026-11-11
 

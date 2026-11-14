@@ -74,6 +74,10 @@ fn spawn_ambient_bridge(
         // takes the strip back.
         let mut quiet_since = tokio::time::Instant::now();
         let mut last_commands = snapshot.borrow().commands_received;
+        // When the link was first found down, if it is down now. A strip that is
+        // unplugged and one with a Bluetooth hiccup look the same for a moment,
+        // and only the first is worth closing the camera for.
+        let mut link_lost: Option<tokio::time::Instant> = None;
         let mut recheck = tokio::time::interval(PREVIEW_RECHECK);
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -124,6 +128,22 @@ fn spawn_ambient_bridge(
                 quiet_since = tokio::time::Instant::now();
             }
             let previewing = published.preview;
+
+            // The strip is the only reason ambient capture exists, so a strip
+            // that has gone releases the camera: the indicator goes out and the
+            // sampler stops reading a screen nothing is following. The mode is
+            // deliberately untouched — it has to survive a power cut — and the
+            // camera is reopened with the link. A link that blinks is not a
+            // strip that is gone, hence the grace period: stopping and starting
+            // the camera for every hiccup would blink the indicator and leave
+            // the page without frames for a second at a time.
+            if published.connected {
+                link_lost = None;
+                ambient.set_strip(true);
+            } else {
+                let since = *link_lost.get_or_insert_with(tokio::time::Instant::now);
+                ambient.set_strip(since.elapsed() < STRIP_GRACE);
+            }
             // Ambient mode is a standing instruction to drive the strip, so it is
             // taken back at once. A colour command clears the mode first, so there
             // is nothing for it to fight.
@@ -183,6 +203,13 @@ fn spawn_ambient_bridge(
                 continue;
             };
             if !reading.calibrated {
+                continue;
+            }
+
+            // Nothing to send it to: a frame written at a link that is not there
+            // is a connect attempt held open for its whole timeout, once per
+            // camera frame, and the worker is already retrying on its own clock.
+            if !published.connected {
                 continue;
             }
 
@@ -261,6 +288,18 @@ const PREVIEW_QUIET: Duration = Duration::from_millis(1500);
 /// Everything else it waits on is an event; this exists so that "the user has
 /// stopped commanding" can be noticed at all.
 const PREVIEW_RECHECK: Duration = Duration::from_millis(400);
+
+/// How long the strip may be unreachable before ambient capture gives up on it.
+///
+/// A link that drops and comes back within a few seconds is ordinary — the
+/// reconnect that follows costs nothing and the preview never noticed. A strip
+/// whose power has been pulled is a different thing: it can be minutes or hours
+/// before it advertises again, and a camera left running for that has its
+/// indicator on, its sampler reading a screen with no audience, and a frame a
+/// second spent trying to attach to a device that is not there. Long enough to
+/// ride out a hiccup, short enough that the indicator goes out while the room is
+/// still being looked at.
+const STRIP_GRACE: Duration = Duration::from_secs(20);
 fn main() -> anyhow::Result<()> {
     // Checked before the runtime starts so the probe costs a TCP connect, not a
     // whole tokio setup.
