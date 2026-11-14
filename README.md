@@ -60,6 +60,10 @@ What you get:
 It works on my machine. Your mileage may vary, and if it does, see
 [Known Issues](#known-issues).
 
+## Ambient Demo
+
+[![Ambient Demo](https://raw.githubusercontent.com/Hyper-Dragon/NeewerTV/main/docs/ambi-demo.gif)](https://raw.githubusercontent.com/Hyper-Dragon/NeewerTV/main/docs/ambi-demo.gif?v=2)
+
 ## Where does it run?
 
 **Anywhere that can see the strip and the broker.** It does not run on your Home
