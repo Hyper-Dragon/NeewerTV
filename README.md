@@ -486,6 +486,12 @@ container runs as root, so the device node needs no group.
 
 ## Version History
 
+**v0.2.2** — the camera follows the strip. Ambient mode used to keep the camera open
+for as long as the mode was set, so pulling the strip's power left it watching a
+screen nothing was following. The camera is now released once the strip has been out
+of reach for twenty seconds — the mode stays set and comes back with the link,
+switching the strip on again if it returned dark.
+
 **v0.2.1** — ambient mode. Point a camera at the television and the strip follows
 what is on it: twenty zones from twenty parts of the panel, with nothing but a camera
 node passed into the container — no screen capture, no display server, no second

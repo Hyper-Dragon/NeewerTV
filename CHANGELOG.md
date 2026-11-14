@@ -6,6 +6,18 @@ All notable changes to this project. The format follows
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.2] — 2026-11-14
+
+Ambient mode outlives a power cut, and the camera was opened for as long as the mode
+was set — so a strip that lost its power left the camera running at a screen nothing
+was following, with a frame per camera tick spent on a link that could not be
+attached. The mode now counts only while the strip is there. Twenty seconds of grace
+keeps a Bluetooth hiccup from blinking the camera, the mode itself is untouched, and
+a strip that comes back from a cut is switched on again rather than fed frames in the
+dark.
+
 ### Fixed
 
 - **Ambient mode kept the camera running after the strip's power was pulled.** The
