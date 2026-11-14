@@ -63,7 +63,7 @@ It works on my machine. Your mileage may vary, and if it does, see
 ## Ambient Demo
 
 <p align="center">
-  <a href="https://github.com/Hyper-Dragon/NeewerTV/blob/main/docs/ambi-demo.gif?raw=true">
+  <a href="https://github.com/Hyper-Dragon/NeewerTV/blob/main/docs/ambi-demo.gif">
     <img src="https://raw.githubusercontent.com/Hyper-Dragon/NeewerTV/main/docs/ambi-demo.gif" alt="NeewerTV Ambient Mode Demo" width="600">
   </a>
 </p>
