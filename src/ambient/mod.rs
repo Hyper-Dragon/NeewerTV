@@ -243,6 +243,9 @@ pub struct Handle {
     /// power cut untouched, and this only decides whether a camera is worth
     /// running to feed a strip that is not listening.
     strip: Arc<watch::Sender<bool>>,
+    /// Whether the light was switched off while the mode was running, so that
+    /// switching it back on can pick the mode up again.
+    resume: Arc<AtomicBool>,
     mode_change: Arc<watch::Sender<bool>>,
     /// Frames captured for the diagnostic download, and whether it is running.
     recorder: Arc<Mutex<Recorder>>,
@@ -464,14 +467,56 @@ impl Handle {
     /// when the link comes back. Nothing about the mode is stored or published
     /// from here — a link that blinks must not look like a mode that ended.
     pub fn set_strip(&self, reachable: bool) {
-        if *self.strip.borrow() == reachable {
+        // `send_replace` rather than `send`: a value only a receiver can accept is
+        // a value that silently refuses to change during the moment no receiver
+        // exists, and the camera thread is the only receiver there is.
+        if self.strip.send_replace(reachable) != reachable {
+            info!(
+                reachable,
+                "ambient capture follows the strip's link; the mode itself is unchanged"
+            );
+        }
+    }
+
+    /// Whether a mode is set aside waiting for the light to come back on.
+    pub fn resume_pending(&self) -> bool {
+        self.resume.load(Ordering::Relaxed)
+    }
+
+    /// Set the mode aside because the light itself was switched off.
+    ///
+    /// Not the same thing as ending it. Anything that changes what the light is
+    /// *doing* — a colour, a brightness, another effect — is a decision to stop
+    /// following the camera. A switch is not: it is a decision to stop lighting
+    /// the room, and the mode is what this light does while it is lit. Remembered
+    /// in memory only, because it is one half of a gesture: a process that
+    /// restarts between the two halves has no gesture left to finish, and it must
+    /// not light a dark room on the strength of somebody's half-pressed switch.
+    pub fn suspend(&self) {
+        if !self.mode() {
             return;
         }
-        info!(
-            reachable,
-            "ambient capture follows the strip's link; the mode itself is unchanged"
-        );
-        let _ = self.strip.send(reachable);
+        self.resume.store(true, Ordering::Relaxed);
+        self.set_mode(false);
+    }
+
+    /// Pick the mode up again after the light was switched back on.
+    ///
+    /// Returns whether there was anything to pick up. A plain "on" is never a
+    /// request for ambient mode: a light somebody switched off and on again
+    /// should come back the way they left it, not decide by itself to start
+    /// following the camera.
+    pub fn resume(&self) -> bool {
+        if !self.resume.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        self.set_mode(true);
+        true
+    }
+
+    /// Forget a set-aside mode, because something has taken its place.
+    pub fn cancel_resume(&self) {
+        self.resume.store(false, Ordering::Relaxed);
     }
 
     /// Drive the strip from the camera while the page is open, without touching the
@@ -699,6 +744,7 @@ pub fn start(
         mode,
         page_mode: Arc::new(AtomicBool::new(false)),
         strip: Arc::new(strip_tx),
+        resume: Arc::new(AtomicBool::new(false)),
         mode_change,
         recorder: Arc::new(Mutex::new(Recorder::default())),
         measure: measure_tx,
@@ -935,5 +981,39 @@ mod tests {
         let viewer = handle.begin_viewing();
         assert!(!handle.page_mode(), "a new page starts with the switch off");
         drop(viewer);
+    }
+
+    #[test]
+    fn switching_off_a_light_that_was_not_in_the_mode_arms_nothing() {
+        // The half-gesture must not become a whole one. A light in some other
+        // effect, switched off and on, has to come back as that effect — arming a
+        // resume here would light the room with a camera feed nobody asked for.
+        let handle = handle();
+        handle.suspend();
+
+        assert!(!handle.resume_pending(), "there was no mode to set aside");
+        assert!(!handle.resume(), "so there is nothing to pick up");
+        assert!(!handle.mode());
+    }
+
+    #[test]
+    fn a_set_aside_mode_survives_exactly_until_the_light_comes_back() {
+        let handle = handle();
+        handle.set_mode(true);
+
+        handle.suspend();
+        assert!(
+            !handle.mode(),
+            "a lit strip in an unlit room is not the mode"
+        );
+        assert!(
+            handle.resume_pending(),
+            "but it is remembered, not forgotten"
+        );
+
+        assert!(handle.resume(), "the switch completed the gesture");
+        assert!(handle.mode());
+        assert!(!handle.resume_pending(), "and it is only ever spent once");
+        assert!(!handle.resume(), "a second on is just a second on");
     }
 }

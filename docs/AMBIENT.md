@@ -92,14 +92,24 @@ and a second entity would need rules about which of the two wins. It only appear
 when a calibration exists — an effect that does nothing is worse than an absent one.
 
 Choosing it is intercepted before the wire encoder, which would otherwise reject the
-name. Choosing *anything else* — a colour, a brightness, a hardware effect,
-`{"state":"OFF"}` — clears the mode first and then runs the command, so a camera
-frame cannot overwrite a colour sixty-six milliseconds later. While the mode runs the
-published effect is `TV Ambient`, and ending it puts back the effect Home Assistant
-was told before.
+name. Choosing *anything else* — a colour, a brightness, a hardware effect — clears the
+mode first and then runs the command, so a camera frame cannot overwrite a colour
+sixty-six milliseconds later. While the mode runs the published effect is `TV Ambient`,
+and ending it puts back the effect Home Assistant was told before.
 
-The mode is stored in the calibration file, which is the only place that outlives
-both a daemon restart and the strip forgetting everything across a power cycle.
+**Switching the light off is not choosing something else.** It is the same gesture as
+switching it on, seen from the other end, so the mode is set aside rather than
+discarded: the camera is released, the strip goes dark, and the mode comes back when
+the light does. Anything that says what the light is *doing* — including a colour
+chosen while the light was off — still outranks it, and cancels the return. A plain
+"on" for a light that was never in the mode does nothing: a light that decides by
+itself to start following a camera is a light nobody trusts.
+
+The set-aside flag lives in memory only. It is one half of a gesture, and a process
+that restarts between the two halves has no gesture left to finish — it must not light
+a dark room on the strength of somebody's half-pressed switch. The mode itself is
+stored in the calibration file, which is the only place that outlives both a daemon
+restart and the strip forgetting everything across a power cycle.
 
 Any command from MQTT also ends a preview, for the same reason it ends the mode.
 

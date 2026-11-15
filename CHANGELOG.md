@@ -8,6 +8,28 @@ All notable changes to this project. The format follows
 
 Nothing yet.
 
+## [0.2.3] — 2026-11-15
+
+A regression in 0.2.2, found on the strip. Switching the light off in Home Assistant and
+back on left the camera closed for good: every payload carrying a command ended the
+ambient mode, power included, so `{"state":"OFF"}` threw the mode away and
+`{"state":"ON"}` had no way to bring it back. 0.2.2 made the camera follow the mode, so
+the mode being discarded stopped being invisible — the light came on, the effect still
+said `TV Ambient`, and nothing followed the screen.
+
+Switching a light off and on again is one gesture, not two. The mode is now set aside
+for the duration and picked back up when the light comes back; anything that says what
+the light is *doing* — a colour, a brightness, another effect, including one chosen
+while the light was off — still outranks it and cancels the return. A plain "on" for a
+light that was never in the mode still does nothing.
+
+### Fixed
+
+- **Ambient mode did not survive the light being switched off and on.** `{"state":"OFF"}`
+  now sets the mode aside rather than ending it, and `{"state":"ON"}` — with or without
+  the brightness Home Assistant sends alongside a toggle — brings it back, so the camera
+  and the strip resume together.
+
 ## [0.2.2] — 2026-11-14
 
 Ambient mode outlives a power cut, and the camera was opened for as long as the mode

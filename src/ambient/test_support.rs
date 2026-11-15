@@ -26,8 +26,14 @@ pub fn calibration() -> super::Calibration {
 }
 
 /// A path nothing should be written to in a test that does not care.
+///
+/// Unique per call. The tests run in parallel threads of one process, and a shared
+/// name meant one test's calibration file answered another test's question about
+/// whether a file exists at all.
 pub fn scratch_path() -> PathBuf {
-    std::env::temp_dir().join(format!("neewertv-mode-{}.json", std::process::id()))
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("neewertv-mode-{}-{n}.json", std::process::id()))
 }
 
 impl Handle {
@@ -54,6 +60,7 @@ impl Handle {
             mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             page_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             strip: Arc::new(strip),
+            resume: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mode_change: Arc::new(mode_change),
             recorder: Arc::new(std::sync::Mutex::new(Recorder::default())),
             measure,

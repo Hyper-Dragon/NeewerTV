@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::app::alerts::AlertSpec;
-use crate::app::command::{self, SetPayload};
+use crate::app::command::{self, Command, SetPayload};
 use crate::app::palette;
 use crate::ble::worker::Snapshot;
 use crate::config::Config;
@@ -522,7 +522,25 @@ async fn handle_publish(
                     Ok(resolved) if resolved.is_empty() => {}
                     Ok(resolved) => {
                         if let Some(ambient) = ambient {
-                            ambient.set_mode(false);
+                            match only_power(&resolved) {
+                                // Switching the light off is not a decision to stop
+                                // following the camera; it is a decision to stop
+                                // lighting the room. The mode is set aside and picked
+                                // back up on the way in, because to the person
+                                // holding the switch that is one gesture, not two.
+                                Some(false) => ambient.suspend(),
+                                Some(true) => {
+                                    ambient.resume();
+                                }
+                                // Anything that says what the light is *doing*
+                                // outranks the camera — including a colour chosen
+                                // while the light was off, which is still a better
+                                // answer than a camera frame when it comes back on.
+                                None => {
+                                    ambient.cancel_resume();
+                                    ambient.set_mode(false);
+                                }
+                            }
                         }
 
                         let batch = crate::app::queue::Batch { commands: resolved };
@@ -551,6 +569,24 @@ async fn handle_publish(
             .send(crate::ble::worker::Message::Alert(spec))
             .await;
     }
+}
+
+/// Which power state a payload asked for, when power is all it asked for.
+///
+/// Brightness rides along with an ordinary light toggle in Home Assistant, and it
+/// is a scale the mode already honours rather than a new presentation, so it does
+/// not turn the payload into a decision about *what* the light does. Anything
+/// else — a colour, an effect, segments, music — does, and answers `None`.
+fn only_power(commands: &[Command]) -> Option<bool> {
+    let mut power = None;
+    for command in commands {
+        match command {
+            Command::Power(on) => power = Some(*on),
+            Command::Brightness(_) => {}
+            _ => return None,
+        }
+    }
+    power
 }
 
 /// Small helper so the `anyhow::Context` import stays local to this file.
@@ -847,6 +883,97 @@ mod tests {
         // sixty-six milliseconds after the colour landed.
         assert!(!ambient.mode(), "the colour must outrank the camera");
         assert!(sent.try_recv().is_ok(), "the colour still has to be sent");
+    }
+
+    #[tokio::test]
+    async fn switching_the_light_off_and_on_again_brings_the_camera_back() {
+        // The defect this exists for: every payload that carried a command ended
+        // the mode, power included. So `{"state":"OFF"}` from Home Assistant
+        // destroyed the mode, `{"state":"ON"}` did not put it back, and the camera
+        // — which now follows the mode — never opened again. The light came on and
+        // the effect still said TV Ambient, so nothing on screen said why.
+        let ambient = ambient_handle(true);
+        let (commands, mut sent) = tokio::sync::mpsc::channel(8);
+        ambient.set_mode(true);
+
+        // Brightness rides along with a toggle, so it must not be read as a
+        // decision about anything other than power.
+        for body in [
+            r#"{"state":"OFF","brightness":80}"#,
+            r#"{"state":"ON","brightness":80}"#,
+        ] {
+            handle_publish(
+                &a_publish(body),
+                "neewertv/set",
+                "neewertv/alert",
+                &commands,
+                Some(&ambient),
+            )
+            .await;
+            assert!(sent.try_recv().is_ok(), "power still has to be sent");
+        }
+
+        assert!(
+            ambient.mode(),
+            "switching the light back on has to bring the mode back"
+        );
+        assert!(
+            !ambient.resume_pending(),
+            "and the set-aside mode is spent, not still waiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_on_does_not_start_ambient_mode_on_its_own() {
+        // Somebody switches a light on. That is not a request to point a camera at
+        // the television, and a light that decides that for itself would be a
+        // light nobody trusts.
+        let ambient = ambient_handle(true);
+        let (commands, mut sent) = tokio::sync::mpsc::channel(4);
+
+        handle_publish(
+            &a_publish(r#"{"state":"ON"}"#),
+            "neewertv/set",
+            "neewertv/alert",
+            &commands,
+            Some(&ambient),
+        )
+        .await;
+
+        assert!(!ambient.mode());
+        assert!(!ambient.resume_pending());
+        assert!(sent.try_recv().is_ok(), "the light still has to come on");
+    }
+
+    #[tokio::test]
+    async fn a_colour_chosen_while_the_light_is_off_outranks_the_mode() {
+        // Otherwise the mode would be restored on the way back on and repaint the
+        // strip a frame after the colour they actually asked for.
+        let ambient = ambient_handle(true);
+        let (commands, mut sent) = tokio::sync::mpsc::channel(8);
+        ambient.set_mode(true);
+
+        for body in [
+            r#"{"state":"OFF"}"#,
+            r#"{"color":{"r":255,"g":0,"b":0}}"#,
+            r#"{"state":"ON"}"#,
+        ] {
+            handle_publish(
+                &a_publish(body),
+                "neewertv/set",
+                "neewertv/alert",
+                &commands,
+                Some(&ambient),
+            )
+            .await;
+        }
+
+        assert!(
+            !ambient.mode(),
+            "the colour they chose is the answer, not the camera"
+        );
+        assert!(!ambient.resume_pending(), "and nothing is left armed");
+        assert!(sent.try_recv().is_ok());
     }
 
     #[tokio::test]

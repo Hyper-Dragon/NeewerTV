@@ -500,6 +500,12 @@ container runs as root, so the device node needs no group.
 
 ## Version History
 
+**v0.2.3** — switching the light off and on again keeps ambient mode. 0.2.2 made the
+camera follow the mode, which showed up a hole: a power-off payload discarded the mode
+outright, so the camera stayed shut until something else re-selected it. Off now sets
+the mode aside and on picks it back up; a colour chosen while the light was off still
+wins.
+
 **v0.2.2** — the camera follows the strip. Ambient mode used to keep the camera open
 for as long as the mode was set, so pulling the strip's power left it watching a
 screen nothing was following. The camera is now released once the strip has been out
